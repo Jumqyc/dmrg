@@ -17,17 +17,6 @@ from numpy.typing import NDArray
 # ---------------------------------------------------------------------------
 _expr_cache: dict[tuple, oe.ContractExpression] = {}
 
-def _get_expr(einsum_str: str, *shapes: tuple[int, ...]) -> oe.ContractExpression:
-    """Return a cached ``oe.ContractExpression`` for *einsum_str* and *shapes*."""
-    key = (einsum_str,) + shapes
-    try:
-        return _expr_cache[key]
-    except KeyError:
-        _expr_cache[key] = oe.contract_expression(
-            einsum_str, *shapes, optimize='auto'
-        )
-        return _expr_cache[key]
-
 def cached_einsum(einsum_str: str, *tensors: torch.Tensor) -> torch.Tensor:
     """Perform an einsum contraction using a cached ``oe.ContractExpression``."""
     shapes = tuple(t.shape for t in tensors)
@@ -725,63 +714,16 @@ class Broomstick:
 
     def cache_envs(self):
         L = self.L
-        self.renv:list[torch.Tensor] = [None] * (L + 1)
-        self.lenv:list[torch.Tensor] = [None] * (L + 1)
+        self.renv: list['torch.Tensor'] = [None] * (L + 1)
+        self.lenv: list['torch.Tensor'] = [None] * (L + 1)
 
         # Right boundary environment: MPO bond dim = Hamiltonian.bond_dim, final state (D-1) set to 1
         self.renv[L] = torch.zeros(1, self.Hamiltonian.bond_dim, 1,
                                    dtype=self.dtype, device=self.device)
         self.renv[L][0, -1, 0] = 1.0
-        for i in range(L - 1, 1, -1): # from L-1 to 2
-            # renv[i] = A[i]^* ⊗ W[i] ⊗ A[i] ⊗ renv[i+1]
-            A_conj = self.state.tensors[i].conj()
-            A_i = self.state.tensors[i]
-            self.renv[i] = cached_einsum('apb,cqd,bjd,ijpq->aic', 
-                                         self.state.tensors[i].conj(), 
-                                         self.state.tensors[i],
-                                         self.renv[i + 1],
-                                         self.Hamiltonian.tensors[i])
+        for i in range(L - 1, 1, -1):
+            self._cache_renv(i)
         self.lenv[0] = torch.ones(1, 1, 1, dtype=self.dtype, device=self.device)
-
-    def move_center_to(self, new_center:int):
-        '''
-        Move the center site index to a new position in the MPS and update the left and right environment tensors accordingly.
-        Args:
-            new_center (int): The new center site index (0 <= new_center < L).
-        Raises:
-            IndexError: If the new center index is out of bounds for the MPS length.
-        '''
-        if new_center == self.center:
-            return  # No need to move if the new center is the same as the current center
-        if new_center < 0 or new_center >= self.L-1:
-            raise IndexError('New center index is out of bounds for the MPS length.')
-
-        if new_center < self.center:
-            while self.center != new_center:  # move to the left
-                self.state._right_canonicalize_site(self.center+1, update_center=True)
-                self.state.move_center_to(self.center - 1)                
-                expr = _get_expr('apb,cqd,bjd,ijpq->aic',
-                                 self.state.tensors[self.center + 1].shape, 
-                                 self.state.tensors[self.center + 1].shape,
-                                 self.renv[self.center + 2].shape,
-                                 self.Hamiltonian.tensors[self.center + 1].shape)
-                self.renv[self.center + 1] = cached_einsum('apb,cqd,bjd,ijpq->aic',
-                    self.state.tensors[self.center + 1].conj(), 
-                    self.state.tensors[self.center + 1],
-                    self.renv[self.center + 2],
-                    self.Hamiltonian.tensors[self.center + 1])
-                self.center -= 1
-
-        elif new_center > self.center:
-            while self.center != new_center: # move to the right
-                self.state.move_center_to(self.center + 1)
-                self.lenv[self.center + 1] = cached_einsum('aic,apb,cqd,ijpq->bjd',
-                    self.lenv[self.center], 
-                    self.state.tensors[self.center].conj(), 
-                    self.state.tensors[self.center],
-                    self.Hamiltonian.tensors[self.center])
-                self.center += 1
-        self.center = new_center
 
     def sweep(self, num_sweeps: int = 5, compute_variance: bool = False):
         '''
@@ -796,8 +738,6 @@ class Broomstick:
             num_sweeps: Number of full DMRG sweeps (right + left passes).
             compute_variance: If True, compute <H²> - <H>² at the end
         '''
-        import sys
-
         self.cache_envs()
         for sweep in range(num_sweeps):
             sys.stderr.write(f'── Sweep {sweep + 1}/{num_sweeps} ──\n')
@@ -808,6 +748,21 @@ class Broomstick:
             print(f'DMRG stops at sweep {sweep + 1}/{num_sweeps}: energy = {E / self.L:.12f}, variance of energy = {self.compute_variance() / self.L:.3e}')
         else:
             print(f'DMRG stops at sweep {sweep + 1}/{num_sweeps}: energy = {E / self.L:.12f}')
+
+
+    def _cache_lenv(self,i:int):
+        self.lenv[i] = cached_einsum('aic,apb,cqd,ijpq->bjd',
+                                        self.lenv[i-1], 
+                                        self.state.tensors[i-1].conj(), 
+                                        self.state.tensors[i-1],
+                                        self.Hamiltonian.tensors[i-1])
+    
+    def _cache_renv(self,i:int):
+        self.renv[i] = cached_einsum('apb,cqd,bjd,ijpq->aic',
+                                        self.state.tensors[i].conj(), 
+                                        self.state.tensors[i],
+                                        self.renv[i + 1],
+                                        self.Hamiltonian.tensors[i])
 
     @torch.no_grad()
     def singlesweep(self):
@@ -843,11 +798,7 @@ class Broomstick:
             if step % SYNC_INTERVAL == 0:
                 E_float = E.item()
             if i < self.L - 2:
-                self.lenv[i + 1] = cached_einsum('aic,apb,cqd,ijpq->bjd',
-                                                 self.lenv[i], 
-                                        self.state.tensors[i].conj(), 
-                                        self.state.tensors[i],
-                                        self.Hamiltonian.tensors[i])
+                self._cache_lenv(i + 1)
             self.center = i + 1
 
             bar = self._progress_bar(step, total_steps, E_float / self.L)
@@ -858,8 +809,6 @@ class Broomstick:
             )
 
         max_trunc_float = max_trunc.item()
-        E_float = E.item()
-
         # special handling for the last site: renormalize the last tensor to be right-isometric
         s_norm = torch.linalg.norm(self.state.tensors[self.L - 1], dim=(1, 2))
         s_norm = torch.clamp(s_norm, min=1e-30)
@@ -871,12 +820,7 @@ class Broomstick:
         self.state.center = self.L - 2
 
         # ── recompute renv[L-1] using the now-right-isometric site L-1 ──
-        
-        self.renv[self.L - 1] = cached_einsum('apb,cqd,bjd,ijpq->aic',
-                                        self.state.tensors[self.L - 1].conj(), 
-                                     self.state.tensors[self.L - 1],
-                                     self.renv[self.L],
-                                     self.Hamiltonian.tensors[self.L - 1])
+        self._cache_renv(self.L - 1)
 
         # ── left sweep ──
         for i in range(self.L - 3, -1, -1):
@@ -888,11 +832,7 @@ class Broomstick:
             if step % SYNC_INTERVAL == 0:
                 E_float = E.item()
             if i > 0:
-                self.renv[i + 1] = cached_einsum('apb,cqd,bjd,ijpq->aic',
-                                                 self.state.tensors[i + 1].conj(), 
-                                        self.state.tensors[i + 1],
-                                        self.renv[i + 2],
-                                        self.Hamiltonian.tensors[i + 1])
+                self._cache_renv(i + 1)
 
             bar = self._progress_bar(step, total_steps, E_float / self.L)
             self._flush_render(
