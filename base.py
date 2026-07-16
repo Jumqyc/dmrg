@@ -561,30 +561,41 @@ class MPO:
         return op_string
 
     @staticmethod
-    def _state_key(c_idx: int, ops_prefix: tuple[str, ...], gap: int) -> tuple:
-        '''Build a state key.
+    def _state_key(c_idx: int | None, op_str: str, rel_pos: int) -> tuple:
+        '''Build a state key from operator string and relative position to the
+        next operator.
 
-        gap = 1 states are shared across couplings (safe because NN
-        couplings have no identity pass-through that could create cross-terms).
-        gap > 1 states are unique per coupling to prevent spurious paths.
+        Nearest-neighbour states (``rel_pos == 1``) are shared across
+        couplings — safe because there are no skipped sites, so no spurious
+        cross-terms can form.  Long-range states (``rel_pos > 1``) are kept
+        unique per coupling via *c_idx* to prevent spurious paths through
+        the shared identity-propagation segments.
         '''
-        if gap == 1:
-            return ops_prefix + ('__g1',)
-        return (c_idx,) + ops_prefix + (f'__g{gap}',)
+        if rel_pos == 1:
+            return (op_str, rel_pos)
+        return (c_idx, op_str, rel_pos)
 
     def build(self):
         '''
         Build the MPO tensors from the current couplings and mapping.
+
+        Intermediate states are identified by ``(op_str, rel_pos)`` pairs
+        where *op_str* is the operator just placed and *rel_pos* is the
+        distance (in sites) to the next operator.  Nearest-neighbour states
+        are shared across couplings; long-range states are kept unique per
+        coupling to avoid spurious paths.  This representation supports an
+        arbitrary number of operators at arbitrary positions.
         '''
         # ── enumerate intermediate states ──
-        state_gaps: dict[tuple, int] = {}  # key → gap
+        # state_ranges: key → set of (from_site, to_site) for identity placement
+        state_ranges: dict[tuple, set[tuple[int, int]]] = {}
         for c_idx, (ops, _, locs) in enumerate(self.couplings):
             for n in range(len(ops) - 1):
-                gap = locs[n + 1] - locs[n]
-                key = self._state_key(c_idx, ops[:n + 1], gap)
-                state_gaps[key] = max(state_gaps.get(key, 0), gap)
+                rel_pos = locs[n + 1] - locs[n]
+                key = self._state_key(c_idx, ops[n], rel_pos)
+                state_ranges.setdefault(key, set()).add((locs[n], locs[n + 1]))
 
-        sorted_keys = sorted(state_gaps, key=lambda x: (len(x), x))
+        sorted_keys = sorted(state_ranges, key=lambda x: (len(x), x))
         self.state_idx = {k: i + 1 for i, k in enumerate(sorted_keys)}
         self.bond_dim = len(self.state_idx) + 2  # start (0) + end (D-1)
 
@@ -605,16 +616,14 @@ class MPO:
             self.tensors[i][D - 1, D - 1] = eye            # bulk end
 
         # identity on skipped sites for long-range couplings
-        for key, gap in state_gaps.items():
-            if gap <= 1:
+        for key, ranges in state_ranges.items():
+            # key is (c_idx, op_str, rel_pos) for long-range, (op_str, 1) for NN
+            rel_pos = key[-1] if len(key) == 3 else key[1]
+            if rel_pos <= 1:
                 continue
             s = self.state_idx[key]
-            c_idx = key[0]                                 # unique key → c_idx
-            _, _, locs = self.couplings[c_idx]
-            for n in range(len(locs) - 1):
-                if locs[n + 1] - locs[n] != gap:
-                    continue
-                for k in range(locs[n] + 1, locs[n + 1]):
+            for from_site, to_site in ranges:
+                for k in range(from_site + 1, to_site):
                     if 0 < k < self.L:
                         self.tensors[k][s, s] = eye
 
@@ -626,9 +635,9 @@ class MPO:
                     mat = coeff * mat
 
                 state_in = 0 if n == 0 else \
-                    self.state_idx[self._state_key(c_idx, ops[:n], locs[n] - locs[n - 1])]
+                    self.state_idx[self._state_key(c_idx, ops[n - 1], locs[n] - locs[n - 1])]
                 state_out = D - 1 if n == len(ops) - 1 else \
-                    self.state_idx[self._state_key(c_idx, ops[:n + 1], locs[n + 1] - locs[n])]
+                    self.state_idx[self._state_key(c_idx, op_str, locs[n + 1] - locs[n])]
 
                 if site == 0:
                     self.tensors[0][0, state_out] += mat
