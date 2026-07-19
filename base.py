@@ -1,7 +1,6 @@
 import torch
 import numpy as np
 import opt_einsum as oe
-import sys
 import pickle as pkl
 
 
@@ -96,8 +95,7 @@ class MPS:
             raise ValueError(f"Bond dimension list length {len(bond_dims)} does not match the expected length of {L + 1}.")
         self.dtype = dtype
         self.device = device
-        self.center = 0
-        # Center site index for canonical form, init as the middle of the chain
+        self.center = 0  # Center site index for canonical form
 
         # Initialize MPS tensors (left_bond_dim, phys_dim, right_bond_dim)
         if init_state is None:
@@ -342,12 +340,12 @@ class MPS:
     def __repr__(self):
         return f"MPS(L={self.L}, phys_dim={self.phys_dim}, bond_dim={self.bond_dim}, center={self.center})"
     def __sizeof__(self):
-        return sum(t.__sizeof__() for t in self.tensors) * self.dtype.itemsize
+        return sum(t.numel() * t.element_size() for t in self.tensors)
 
     @property
     def shape(self)-> list[int]:
         '''
-        Return the dimension of virtual bond of the MPS and the MPO.
+        Return the virtual bond dimensions of the MPS.
         '''
         return self.bond_dim
 
@@ -416,9 +414,6 @@ class MPO:
 
     def __repr__(self):
         return f"MPO(L={self.L}, physical_dim={self.physical_dim}, bond_dim={self.bond_dim})"
-    def __size__(self):
-        return sum(t.numel() for t in self.tensors) * self.dtype.itemsize
-
     # ── Arithmetic dunders ──────────────────────────────────────────────
 
     def __add__(self, other):
@@ -655,7 +650,7 @@ class MPO:
                 else:
                     self.tensors[site][state_in, state_out] += mat
     def __sizeof__(self):
-        return sum(t.__sizeof__() for t in self.tensors) * self.dtype.itemsize
+        return sum(t.numel() * t.element_size() for t in self.tensors)
 
 
 class Broomstick:
@@ -691,6 +686,7 @@ class Broomstick:
         self.center = 0
         self.renv = []
         self.lenv = []
+        self._last_energy = None  # cached from the most recent sweep
 
     def to(self, device):
         '''
@@ -702,7 +698,7 @@ class Broomstick:
 
     def copy(self):
         '''
-        Create a deep copy of the DMRG_engine instance.
+        Create a deep copy of the Broomstick instance.
         '''
         new = Broomstick(self.state.copy(),
                           self.Hamiltonian.copy(),
@@ -725,29 +721,57 @@ class Broomstick:
             self._cache_renv(i)
         self.lenv[0] = torch.ones(1, 1, 1, dtype=self.dtype, device=self.device)
 
-    def sweep(self, num_sweeps: int = 5, compute_variance: bool = False):
+    def sweep(self, num_sweeps: int = 5, compute_variance: bool = False,
+              energy_tol: float = 1e-12, patience: int = 3):
         '''
         Perform the Density Matrix Renormalization Group (DMRG) algorithm to find
         the ground state of the spin chain Hamiltonian.
 
-        Each sweep renders a multi-line progress display (flush area) that
-        overwrites itself in-place in the terminal.  The final summary of
-        each sweep covers the flush area before the next sweep begins.
+        After each sweep the energy density, max truncation error, and current
+        max bond dimension are printed.  Early stopping triggers when the
+        absolute change in energy density is below *energy_tol* for *patience*
+        consecutive sweeps.
 
         Args:
-            num_sweeps: Number of full DMRG sweeps (right + left passes).
-            compute_variance: If True, compute <H²> - <H>² at the end
+            num_sweeps: Maximum number of full DMRG sweeps (right + left passes).
+            compute_variance: If True, compute <H²> - <H>² at the end.
+            energy_tol: Absolute tolerance on energy density for early stopping.
+            patience: Number of consecutive non-improving sweeps before stopping.
         '''
         self.cache_envs()
+        best_E = None
+        stale = 0
+
         for sweep in range(num_sweeps):
-            sys.stderr.write(f'── Sweep {sweep + 1}/{num_sweeps} ──\n')
-            sys.stderr.flush()
             E, trunc = self.singlesweep()
-            print(f'Sweep {sweep + 1}/{num_sweeps}: E = {E / self.L:.12f}, max_trunc_err = {trunc:.3e}')
+            self._last_energy = E
+            E_density = E / self.L
+            max_bond = max(self.state.bond_dim)
+
+            print(f'Sweep {sweep + 1}/{num_sweeps}:  '
+                  f'E/L = {E_density:.12f}  '
+                  f'max_trunc_err = {trunc:.3e}  '
+                  f'max_bond_dim = {max_bond}')
+
+            # ── early stopping ──
+            if best_E is None or E_density < best_E - energy_tol:
+                best_E = E_density
+                stale = 0
+            else:
+                stale += 1
+                if stale >= patience:
+                    print(f'Early stopping: energy density unchanged '
+                          f'({abs(E_density - best_E):.3e} ≤ {energy_tol:.0e}) '
+                          f'for {patience} sweeps.')
+                    break
+
         if compute_variance:
-            print(f'DMRG stops at sweep {sweep + 1}/{num_sweeps}: energy = {E / self.L:.12f}, variance of energy = {self.compute_variance() / self.L:.3e}')
+            print(f'DMRG stops at sweep {sweep + 1}/{num_sweeps}: '
+                  f'energy density = {E / self.L:.12f}, '
+                  f'variance = {self.compute_variance() / self.L:.3e}')
         else:
-            print(f'DMRG stops at sweep {sweep + 1}/{num_sweeps}: energy = {E / self.L:.12f}')
+            print(f'DMRG stops at sweep {sweep + 1}/{num_sweeps}: '
+                  f'energy density = {E / self.L:.12f}')
 
 
     def _cache_lenv(self,i:int):
@@ -770,45 +794,29 @@ class Broomstick:
         Perform a single sweep of the DMRG algorithm, optimizing the MPS tensors
         at each site.  Returns (energy, max_truncation_error).
 
-        Renders a multi-line progress display that overwrites itself in-place
-        (flush area).  The final summary line covers the flush area on exit.
+        All intermediate values (max_trunc, energy) are kept on the GPU and
+        synced to the CPU only once at the end of the sweep.
 
         Environment tensors are updated incrementally without QR
         canonicalization: the SVD inside update() already guarantees that the
         MPS tensors are left- / right-isometric as the sweep progresses.
 
-        The sweep order is right (0 → L-1) then left (L-2 → 0).  The center site index is updated accordingly, and the MPS is left in a canonical form at the end of the sweep.
+        The sweep order is right (0 → L-1) then left (L-2 → 0).  The center
+        site index is updated accordingly, and the MPS is left in a canonical
+        form at the end of the sweep.
         '''
         if not self.lenv or not self.renv:
             self.cache_envs()
         max_trunc = torch.tensor(0.0, dtype=torch.float64, device=self.device)
-        max_trunc_float = 0.0          # cached CPU value for progress display
-        E_float = 0.0                   # cached energy for progress display
-
-        total_steps = (self.L - 1) + (self.L - 2)  # right + left passes
-        step = 0
-
-        SYNC_INTERVAL = 8 # avoid GPU→CPU sync on every step; sync every 8 steps for progress display
 
         # ── right sweep ──
         for i in range(self.L - 1):
             E, trunc_err = self.update(direction='right')
             max_trunc = torch.maximum(max_trunc, trunc_err)
-            step += 1
-            if step % SYNC_INTERVAL == 0:
-                E_float = E.item()
             if i < self.L - 2:
                 self._cache_lenv(i + 1)
             self.center = i + 1
 
-            bar = self._progress_bar(step, total_steps, E_float / self.L)
-            self._flush_render(
-                f"    {bar}",
-                f"    bond_dim @ center = {self.state.bond_dim[self.center]:4d}",
-                f"    max_trunc_err     = {max_trunc_float:.3e}",
-            )
-
-        max_trunc_float = max_trunc.item()
         # special handling for the last site: renormalize the last tensor to be right-isometric
         s_norm = torch.linalg.norm(self.state.tensors[self.L - 1], dim=(1, 2))
         s_norm = torch.clamp(s_norm, min=1e-30)
@@ -818,59 +826,30 @@ class Broomstick:
         )
         self.center = self.L - 2
         self.state.center = self.L - 2
-
-        # ── recompute renv[L-1] using the now-right-isometric site L-1 ──
         self._cache_renv(self.L - 1)
-
-        # ── left sweep ──
         for i in range(self.L - 3, -1, -1):
             self.center = i
             self.state.center = i
             E, trunc_err = self.update(direction='left')
             max_trunc = torch.maximum(max_trunc, trunc_err)
-            step += 1
-            if step % SYNC_INTERVAL == 0:
-                E_float = E.item()
             if i > 0:
                 self._cache_renv(i + 1)
 
-            bar = self._progress_bar(step, total_steps, E_float / self.L)
-            self._flush_render(
-                f"  {bar}",
-                f"    bond_dim @ center = {self.state.bond_dim[self.center + 1]:4d}",
-                f"    max_trunc_err      = {max_trunc_float:.3e}",
-            )
-
-        self._flush_finish()
-        # final sync at end of sweep
-        max_trunc_float = max_trunc.item()
-        E_float = E.item()
-        return E_float, max_trunc_float
+        # ── sync to CPU once at end of sweep ──
+        return E.item(), max_trunc.item()
 
     @torch.no_grad()
     def _lanczos(self,
                  i: int,
                  v0: torch.Tensor,
                  n_iter: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
-        """Lanczos diagonalisation of the effective Hamiltonian at bond *i*.
-
-        Args:
-            i: center site index.
-            v0: 4‑leg tensor ``(bond_dim[i], phys_dim, phys_dim, bond_dim[i+2])``.
-            n_iter: maximum number of Lanczos iterations.
-        Returns:
-            ``(E0, v_ground)`` where v_ground has the same 4‑leg shape as v0.
-        """
-
         v0 = v0 / torch.linalg.norm(v0)
 
-        # store Krylov vectors as flat arrays for efficient linear algebra
         vecs = torch.zeros((n_iter + 1, *v0.shape), dtype=v0.dtype, device=v0.device)
         alphas = torch.zeros(n_iter, dtype=torch.float64, device=v0.device)
         betas = torch.zeros(n_iter, dtype=torch.float64, device=v0.device)
 
         # pre computed contraction
-        # usually D > phisycal_dim^2, so we can save some time by precomputing the left and right environments
         lenv = torch.einsum('apb,pqij->abqij', 
                             self.lenv[i],
                             self.Hamiltonian.tensors[i])
@@ -927,7 +906,7 @@ class Broomstick:
         '''
         i = self.center
 
-        assert self.center == self.state.center, "Center site index mismatch between DMRG_engine and MPS."
+        assert self.center == self.state.center, "Center site index mismatch between Broomstick and MPS."
 
         # step 1, form the current 2-site state (warm start for Lanczos)
         state = cached_einsum('bjx,xld->bjld',self.state.tensors[i],
@@ -937,12 +916,9 @@ class Broomstick:
         E, v = self._lanczos(i, state, n_iter=n_iter)
         # v is 4‑leg, same shape as state
 
-        # step 3, svd and update the MPS tensors
-        p = self.state.phys_dim
-        u, s, vh = torch.linalg.svd(
-            v.reshape(self.state.bond_dim[i] * p, p * self.state.bond_dim[i + 2]), full_matrices=False)
-
-        s2_total = torch.sum(s * s)
+        # step 3, low-rank SVD and update the MPS tensors
+        s2_total = torch.sum(v.conj() * v).real  # = ||v||_F² = Σ σ_i²
+        u, s, vh = self._svd(v)
         mask = (s > self.svd_tol)
         s = s[mask]
         u = u[:, mask]
@@ -976,67 +952,48 @@ class Broomstick:
         self.state.bond_dim[i + 1] = new_bond
         return E.real, trunc_err
 
+    def _svd(self, tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        '''
+        Perform SVD on a 4-leg tensor and return U, S, Vh.
+        '''
+        p = self.state.phys_dim
+        u, s, vh = torch.linalg.svd(
+            tensor.reshape(self.state.bond_dim[self.center] * p,
+                           p * self.state.bond_dim[self.center + 2]),
+            full_matrices=False)
+        return u, s, vh
+
     @property
+    def energy(self) -> float:
+        '''
+        Energy of the current MPS state from the most recent sweep, or
+        computed on-the-fly from the environments if no sweep has been run.
+        '''
+        if self._last_energy is not None:
+            return self._last_energy
+        # Fallback: compute from environments (only used before any sweep)
+        return self._compute_energy()
+
     @torch.no_grad()
-    def energy(self)->complex:
-        '''
-        Compute the energy of the current MPS state with respect to the Hamiltonian MPO.
-        '''
+    def _compute_energy(self) -> float:
         lenv = cached_einsum('apc,pqij,aib,cjd->bqd',
                              self.lenv[self.center],
                          self.Hamiltonian.tensors[self.center],
-                         self.state.tensors[self.center].conj(), 
+                         self.state.tensors[self.center].conj(),
                          self.state.tensors[self.center])
         renv = cached_einsum('apc,qpij,bia,djc->bqd',self.renv[self.center + 2],
                          self.Hamiltonian.tensors[self.center + 1],
-                         self.state.tensors[self.center + 1].conj(), 
+                         self.state.tensors[self.center + 1].conj(),
                          self.state.tensors[self.center + 1])
 
         return torch.einsum('bqd,bqd->', lenv, renv).item()
     
     def __sizeof__(self):
-        return self.state.__sizeof__() + \
-                self.Hamiltonian.__sizeof__() + \
-                (sum(t.__sizeof__() for t in self.lenv) +
-                sum(t.__sizeof__() for t in self.renv)) * self.dtype.itemsize
+        return (self.state.__sizeof__() +
+                self.Hamiltonian.__sizeof__() +
+                sum(t.numel() * t.element_size() for t in self.lenv if t is not None) +
+                sum(t.numel() * t.element_size() for t in self.renv if t is not None))
 
-    def _flush_render(self, *lines: str):
-        '''Render multiple flush lines, overwriting the previous flush block in-place.
-        Uses ANSI escape codes to move the cursor up and overwrite previously
-        rendered lines. Call _flush_finish() to move past the flush area when done.
-        Args:
-            *lines: One string per line of output. Must always be called with the
-                    same number of lines within a flush session for correct behaviour.
-        '''
-        n = len(lines)
-        prev = getattr(self, '_flush_count', 0)
-        if prev > 0:
-            sys.stderr.write(f'\033[{prev}F')
-        for line in lines:
-            sys.stderr.write(f'\033[K{line}\n')
-        sys.stderr.flush()
-        self._flush_count = n
-
-    def _flush_finish(self):
-        '''Clear the flush area and move the cursor past it.'''
-        import sys
-        n = getattr(self, '_flush_count', 0)
-        if n > 0:
-            sys.stderr.write(f'\033[{n}F')
-            sys.stderr.write('\033[0J')
-            sys.stderr.flush()
-            self._flush_count = 0
-
-    @staticmethod
-    def _progress_bar(step: int, total: int,
-                      energy: float, bar_width: int = 30):
-        '''Return a compact progress-bar string (single line).  Used as a building
-        block by the multi-line flush display; does NOT write to stderr itself.'''
-        frac = step / total
-        filled = int(bar_width * frac)
-        bar = '█' * filled + '░' * (bar_width - filled)
-        return (f"Step {step}/{total} |{bar}| {frac * 100:3.0f}%  "
-                f"E={energy:.8f}")
     def compute_variance(self) -> float:
         '''
         Compute var(H) = <H²> - <H>² for the current state.
