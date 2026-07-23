@@ -1,12 +1,12 @@
 import torch
 import numpy as np
-import opt_einsum as oe
 import pickle as pkl
 
 
 from math import sqrt
 from typing import Literal
 from numpy.typing import NDArray
+from opt_einsum import contract_expression
 
 # ---------------------------------------------------------------------------
 # Module-level cache for oe.contract_expression objects.
@@ -14,16 +14,16 @@ from numpy.typing import NDArray
 # This avoids redundant path-optimization when the same contraction shape
 # is encountered repeatedly (e.g. inside Lanczos or sweep environment updates).
 # ---------------------------------------------------------------------------
-_expr_cache: dict[tuple, oe.ContractExpression] = {}
+_expr_cache: dict = {}
 
 def cached_einsum(einsum_str: str, *tensors: torch.Tensor) -> torch.Tensor:
-    """Perform an einsum contraction using a cached ``oe.ContractExpression``."""
+    """Perform an einsum contraction using a cached ``ContractExpression``."""
     shapes = tuple(t.shape for t in tensors)
     key = (einsum_str,) + shapes
     try:
         return _expr_cache[key](*tensors)
     except KeyError:
-        _expr_cache[key] = oe.contract_expression(
+        _expr_cache[key] = contract_expression(
             einsum_str, *shapes, optimize='auto'
         )
         return _expr_cache[key](*tensors)
