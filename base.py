@@ -172,7 +172,7 @@ class MPS:
 
     def norm(self,mode:Literal['direct','env'] = 'env')->complex:
         if mode == 'env':
-            return torch.einsum('abc,abc->', self.tensors[self.center].conj(), self.tensors[self.center]).item()
+            return cached_einsum('abc,abc->', self.tensors[self.center].conj(), self.tensors[self.center]).item()
         elif mode == 'direct':
             return self.expectation({})
 
@@ -191,10 +191,10 @@ class MPS:
         tensors[1..L-1] = site 1..L-1 operators, tensors[L] = right boundary.
         '''
         # Site 0: use MPO tensors[0] (left boundary + site-0 operators)
-        lenv = torch.einsum('bpa,dqc,uwpq->acw',
+        lenv = cached_einsum('bpa,dqc,uwpq->acw',
                             self.tensors[0].conj(), self.tensors[0], mpo.tensors[0])
         for i in range(1, self.L):
-            lenv = torch.einsum('bdw,bpa,dqc,wxpq->acx',
+            lenv = cached_einsum('bdw,bpa,dqc,wxpq->acx',
                                 lenv, self.tensors[i].conj(), self.tensors[i], mpo.tensors[i])
         # lenv shape: (1, 1, D); pick the MPO end state (index -1)
         return lenv[0, 0, -1].item()
@@ -206,15 +206,15 @@ class MPS:
         '''
         try:
             op = operators[0]
-            lenv = torch.einsum('aib,ajc,ij->bc', self.tensors[0].conj(), self.tensors[0], op)
+            lenv = cached_einsum('aib,ajc,ij->bc', self.tensors[0].conj(), self.tensors[0], op)
         except KeyError:
-            lenv = torch.einsum('aib,aic->bc', self.tensors[0].conj(), self.tensors[0])
+            lenv = cached_einsum('aib,aic->bc', self.tensors[0].conj(), self.tensors[0])
         for i in range(1,self.L):
             try:
                 op = operators[i]
-                lenv = torch.einsum('ab,aic,bjd,ij->cd', lenv, self.tensors[i].conj(), self.tensors[i], op)
+                lenv = cached_einsum('ab,aic,bjd,ij->cd', lenv, self.tensors[i].conj(), self.tensors[i], op)
             except KeyError:
-                lenv = torch.einsum('ab,aic,bid->cd', lenv, self.tensors[i].conj(), self.tensors[i])
+                lenv = cached_einsum('ab,aic,bid->cd', lenv, self.tensors[i].conj(), self.tensors[i])
         return torch.trace(lenv).item()
 
 
@@ -230,17 +230,17 @@ class MPS:
         rightmost = max(operators.keys())
 
         self.move_center_to(leftmost)
-        lenv = torch.einsum('aic,ajd,ij->cd',
+        lenv = cached_einsum('aic,ajd,ij->cd',
                                     self.tensors[leftmost].conj(),
                                     self.tensors[leftmost],
                                     operators[leftmost])
         for i in range(leftmost + 1, rightmost + 1):
             try:
                 op = operators[i]
-                lenv = torch.einsum('ab,aic,bjd,ij->cd', lenv,
+                lenv = cached_einsum('ab,aic,bjd,ij->cd', lenv,
                                     self.tensors[i].conj(), self.tensors[i], op)
             except KeyError:
-                lenv = torch.einsum('ab,aic,bid->cd', lenv,
+                lenv = cached_einsum('ab,aic,bid->cd', lenv,
                                     self.tensors[i].conj(), self.tensors[i])
         return torch.trace(lenv).item()
 
@@ -286,7 +286,7 @@ class MPS:
         new_bond = q.shape[-1]
         self.bond_dim[i+1] = new_bond
         self.tensors[i] = q.reshape(self.bond_dim[i],self.phys_dim,new_bond) # (bond_dim[i], phys_dim, new_bond)
-        self.tensors[i+1] = torch.einsum('ab,bcd->acd', r, self.tensors[i+1])
+        self.tensors[i+1] = cached_einsum('ab,bcd->acd', r, self.tensors[i+1])
         if update_center:
             self.center = i + 1
         del q,r
@@ -313,7 +313,7 @@ class MPS:
         q,r = q.H, r.H
         self.bond_dim[i] = q.shape[0]
         self.tensors[i] = q.reshape(self.bond_dim[i], self.phys_dim, self.bond_dim[i+1])
-        self.tensors[i-1] = torch.einsum('lpb,br->lpr', self.tensors[i-1], r)
+        self.tensors[i-1] = cached_einsum('lpb,br->lpr', self.tensors[i-1], r)
         if update_center:
             self.center = i - 1
         del r, q
@@ -356,31 +356,31 @@ class MPO:
     @torch.no_grad()
     def __init__(self,
                  L:int,
-                 physical_dim:int,
+                 phys_dim:int,
                  mapping:dict[str,torch.Tensor]|None = None,
                  dtype:torch.dtype = torch.complex128,
                  device:torch.device = torch.device('cuda')):
         '''
         Args:
             L (int): Length of the MPO (number of sites).
-            physical_dim (int): Physical dimension of the MPO.
+            phys_dim (int): Physical dimension of the MPO.
             mapping (dict[str, torch.Tensor]): A dictionary mapping operator names to their corresponding torch.Tensor representations. If None, default mappings will be used.
         '''
         self.dtype = dtype
         self.device = device
         self.L = L
         self.couplings: list[tuple[tuple[str, ...], complex, tuple[int, ...]]] = []
-        self.physical_dim = physical_dim
+        self.physical_dim = phys_dim
         self.tensors: list[torch.Tensor] = []
         self.bond_dim = 0
 
         if mapping is None:
-            spin_op = SpinOperator(phys_dim=physical_dim, dtype=dtype, device=device).data
+            spin_op = SpinOperator(phys_dim=phys_dim, dtype=dtype, device=device).data
             self.mapping = {
                 'X': spin_op[0],
                 'Y': spin_op[1],
                 'Z': spin_op[2],
-                'I': torch.eye(physical_dim, dtype=dtype, device=device)
+                'I': torch.eye(phys_dim, dtype=dtype, device=device)
             }
         else:
             self.mapping = mapping
@@ -476,7 +476,7 @@ class MPO:
                 # t1: (wL1, wR1, p, q), t2: (wL2, wR2, q, r)  →  (wL1*wL2, wR1*wR2, p, r)
                 wL1, wR1 = t1.shape[0], t1.shape[1]
                 wL2, wR2 = t2.shape[0], t2.shape[1]
-                new_t = torch.einsum('abpq,cdqr->acbdpr', t1, t2).reshape(
+                new_t = cached_einsum('abpq,cdqr->acbdpr', t1, t2).reshape(
                     wL1 * wL2, wR1 * wR2, self.physical_dim, self.physical_dim)
                 new.tensors.append(new_t)
             new.bond_dim = self.bond_dim * other.bond_dim
@@ -568,23 +568,12 @@ class MPO:
         distance (in sites) to the next operator.  Nearest-neighbour states
         are shared across couplings; long-range states are kept unique per
         coupling to avoid spurious paths.
-
-        When two couplings share the same first-operator site and NN
-        rel_pos, their first-state keys are disambiguated via *c_idx* to
-        prevent coefficient cross-multiplication.
         '''
-        # ── detect same-site conflicts for NN first states ──
-        # If two couplings share (op_str, rel_pos=1, site) for their first
-        # transition, they must use unique keys to avoid cross-terms.
         first_site_counts: dict[tuple, int] = {}
         for c_idx, (ops, _, locs) in enumerate(self.couplings):
             if len(ops) > 1 and locs[1] - locs[0] == 1:
                 key = (ops[0], 1, locs[0])  # (op_str, rel_pos=1, site)
                 first_site_counts[key] = first_site_counts.get(key, 0) + 1
-
-        # ── enumerate intermediate states ──
-        # state_ranges: key → set of (from_site, to_site) for identity placement
-        # coupling_keys[c_idx] = list of state_out keys for each transition
         state_ranges: dict[tuple, set[tuple[int, int]]] = {}
         coupling_keys: list[list[tuple]] = [[] for _ in self.couplings]
         for c_idx, (ops, _, locs) in enumerate(self.couplings):
@@ -605,7 +594,6 @@ class MPO:
         self.state_idx = {k: i + 1 for i, k in enumerate(sorted_keys)}
         self.bond_dim = len(self.state_idx) + 2  # start (0) + end (D-1)
 
-        # ── allocate tensors ──
         D = self.bond_dim
         p = self.physical_dim
         self.tensors = [torch.zeros((1, D, p, p), dtype=self.dtype, device=self.device)]
@@ -613,7 +601,6 @@ class MPO:
                          for _ in range(1, self.L)]
         self.tensors += [torch.zeros((D, 1, p, p), dtype=self.dtype, device=self.device)]
 
-        # ── identity diagonals ──
         eye = torch.eye(p, dtype=self.dtype, device=self.device)
         self.tensors[0][0, 0] = eye                       # site-0 start
         self.tensors[self.L][D - 1, 0] = eye               # right boundary
@@ -721,8 +708,11 @@ class Broomstick:
             self._cache_renv(i)
         self.lenv[0] = torch.ones(1, 1, 1, dtype=self.dtype, device=self.device)
 
-    def sweep(self, num_sweeps: int = 5, compute_variance: bool = False,
-              energy_tol: float = 1e-12, patience: int = 3):
+    def sweep(self, 
+              num_sweeps: int = 5, 
+              compute_variance: bool = False,
+              energy_tol: float = 1e-12, 
+              patience: int = 3):
         '''
         Perform the Density Matrix Renormalization Group (DMRG) algorithm to find
         the ground state of the spin chain Hamiltonian.
@@ -751,7 +741,7 @@ class Broomstick:
             print(f'Sweep {sweep + 1}/{num_sweeps}:  '
                   f'E/L = {E_density:.12f}  '
                   f'max_trunc_err = {trunc:.3e}  '
-                  f'max_bond_dim = {max_bond}')
+                  f'bond_dim = {self.state.bond_dim}')
 
             # ── early stopping ──
             if best_E is None or E_density < best_E - energy_tol:
@@ -850,10 +840,10 @@ class Broomstick:
         betas = torch.zeros(n_iter, dtype=torch.float64, device=v0.device)
 
         # pre computed contraction
-        lenv = torch.einsum('apb,pqij->abqij', 
+        lenv = cached_einsum('apb,pqij->abqij', 
                             self.lenv[i],
                             self.Hamiltonian.tensors[i])
-        renv = torch.einsum('crd,qrkl->cdqkl',
+        renv = cached_einsum('crd,qrkl->cdqkl',
                             self.renv[i + 2],
                             self.Hamiltonian.tensors[i + 1])
         def helper(v: torch.Tensor) -> torch.Tensor:
@@ -888,7 +878,7 @@ class Broomstick:
         eigvals, eigvecs_T = torch.linalg.eigh(T)
 
         E0 = eigvals[0]
-        v_ground = torch.einsum('a,aijkl->ijkl', 
+        v_ground = cached_einsum('a,aijkl->ijkl', 
                                 eigvecs_T[:n_iter, 0].to(dtype=vecs.dtype), 
                                 vecs[:n_iter,...])
 
@@ -908,17 +898,14 @@ class Broomstick:
 
         assert self.center == self.state.center, "Center site index mismatch between Broomstick and MPS."
 
-        # step 1, form the current 2-site state (warm start for Lanczos)
         state = cached_einsum('bjx,xld->bjld',self.state.tensors[i],
                      self.state.tensors[i + 1])
-
-        # step 2, matrix-free Lanczos — Heff is never materialised
         E, v = self._lanczos(i, state, n_iter=n_iter)
-        # v is 4‑leg, same shape as state
+        u, s, vh = torch.linalg.svd(
+            v.reshape(self.state.bond_dim[i] * self.state.phys_dim, 
+                      self.state.phys_dim * self.state.bond_dim[i + 2]), 
+                      full_matrices=False)
 
-        # step 3, low-rank SVD and update the MPS tensors
-        s2_total = torch.sum(v.conj() * v).real  # = ||v||_F² = Σ σ_i²
-        u, s, vh = self._svd(v)
         mask = (s > self.svd_tol)
         s = s[mask]
         u = u[:, mask]
@@ -927,41 +914,36 @@ class Broomstick:
         new_bond = min(len(s), self.max_bond_dim)
         s = s[:new_bond]
         u = u[:, :new_bond]
-        Vh = vh[:new_bond, :]
+        vh = vh[:new_bond, :]
 
-        s2_kept = torch.sum(s * s)
-        trunc_err = torch.where(s2_total > 0, 1.0 - s2_kept / s2_total,
-                                torch.tensor(0.0, device=s.device, dtype=torch.float64))
+        s2_kept = torch.sum(s*s).real
+        trunc_err =  1.0 - s2_kept
+                              
 
         s /= torch.sqrt(s2_kept)
         if direction == 'right':
-            self.state.tensors[i] = u.reshape(self.state.bond_dim[i], self.state.phys_dim, new_bond)
-            self.state.tensors[i + 1] = (s.to(Vh.dtype).unsqueeze(1) * Vh).reshape(new_bond, self.state.phys_dim, self.state.bond_dim[i + 2])
+            self.state.tensors[i] = u.reshape(
+                self.state.bond_dim[i], 
+                self.state.phys_dim, 
+                new_bond) # M[i] = U,
+            self.state.tensors[i + 1] = (s.to(vh.dtype).unsqueeze(1) * vh).reshape(
+                new_bond, 
+                self.state.phys_dim, 
+                self.state.bond_dim[i + 2]) # M[i+1] = S Vh,
             self.state.center = i + 1  # singular values absorbed into site i+1
 
         elif direction == 'left':
             self.state.tensors[i] = (u * s.to(u.dtype).unsqueeze(0)).reshape(
                 self.state.bond_dim[i], 
                 self.state.phys_dim, 
-                new_bond)
-            self.state.tensors[i + 1] = Vh.reshape(
+                new_bond)                   # M[i] = U S,
+            self.state.tensors[i + 1] = vh.reshape(
                 new_bond, 
                 self.state.phys_dim, 
-                self.state.bond_dim[i + 2])
+                self.state.bond_dim[i + 2]) # M[i] = Vh,
             self.state.center = i  # singular values stay at site i
         self.state.bond_dim[i + 1] = new_bond
         return E.real, trunc_err
-
-    def _svd(self, tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        '''
-        Perform SVD on a 4-leg tensor and return U, S, Vh.
-        '''
-        p = self.state.phys_dim
-        u, s, vh = torch.linalg.svd(
-            tensor.reshape(self.state.bond_dim[self.center] * p,
-                           p * self.state.bond_dim[self.center + 2]),
-            full_matrices=False)
-        return u, s, vh
 
     @property
     def energy(self) -> float:
@@ -986,7 +968,7 @@ class Broomstick:
                          self.state.tensors[self.center + 1].conj(),
                          self.state.tensors[self.center + 1])
 
-        return torch.einsum('bqd,bqd->', lenv, renv).item()
+        return cached_einsum('bqd,bqd->', lenv, renv).item()
     
     def __sizeof__(self):
         return (self.state.__sizeof__() +
