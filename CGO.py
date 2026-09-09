@@ -20,6 +20,7 @@ from ext_register import extends_Broomstick
 # where each R_j is an independent random Hermitian matrix acting on a site
 # of L0.  The product is Hermitian, so multiplying by 1j makes A_i
 # anti-Hermitian.
+# based on PhysRevB.94.195143
 # ---------------------------------------------------------------------------
 
 
