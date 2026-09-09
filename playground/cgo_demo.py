@@ -21,18 +21,18 @@ from base import MPS, MPO, Broomstick
 import CGO  # registers Broomstick.CGO
 
 
-CPU = torch.device('cpu')
+CUDA = torch.device('cuda')
 DTYPE = torch.complex128
 
 
 def main() -> None:
-    L = 6
+    L = 20
     max_bond_dim = 8
 
     # Heisenberg chain: H = sum_i S_i . S_{i+1}
     torch.manual_seed(0)
-    mps = MPS(L, 2, device=CPU, dtype=DTYPE)
-    mpo = MPO(L, 2, device=CPU, dtype=DTYPE)
+    mps = MPS(L, 2, device=CUDA, dtype=DTYPE)
+    mpo = MPO(L, 2, device=CUDA, dtype=DTYPE)
     for i in range(L - 1):
         for name in ('X', 'Y', 'Z'):
             mpo.add_couplings((name, name), 1.0, (i, i + 1))
@@ -42,22 +42,21 @@ def main() -> None:
         mps, mpo,
         max_bond_dim=max_bond_dim,
         svd_tol=1e-14,
-        device=CPU,
+        device=CUDA,
         dtype=DTYPE,
     )
     with contextlib.redirect_stdout(io.StringIO()):
         stick.sweep(num_sweeps=4)
 
     # Observable B = Sz_2 Sz_3
-    sz = torch.diag(torch.tensor([0.5, -0.5], dtype=DTYPE))
-    operators = {2: sz, 3: sz}
+    sz = torch.diag(torch.tensor([0.5, -0.5],device = CUDA, dtype=DTYPE))
+    operators = {10: sz, 11: sz}
 
     exact = float(stick.state.expectation(operators).real)
     lower, upper = stick.CGO(
-        l=1,
+        l=2,
         operators=operators,
-        num_sample=10,
-        seed=0,
+        num_sample=30,
     )
 
     print(f'ground-state energy: {stick.energy:.12f}')
