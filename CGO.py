@@ -2,7 +2,6 @@ import math
 import warnings
 
 import cvxpy as cp
-import numpy as np
 import torch
 
 from base import MPS, MPO, Broomstick, cached_einsum
@@ -11,13 +10,6 @@ from ext_register import extends_Broomstick
 
 # ---------------------------------------------------------------------------
 # CGO helpers.
-#
-# One sample is a product operator
-#
-#     A_i = 1j * (R_1 (x) R_2 (x) ... (x) R_n),
-#
-# where each R_j is an independent random Hermitian matrix acting on a site of
-# L0.  The product is Hermitian, so multiplying by 1j makes A_i anti-Hermitian.
 # Based on PhysRevB.94.195143.
 # ---------------------------------------------------------------------------
 
@@ -145,6 +137,46 @@ def _orthonormal_transform(gram: torch.Tensor,
     return (evecs / evals.sqrt().unsqueeze(0)).conj().T
 
 
+def _select_boundary_indices(weights: torch.Tensor,
+                             chi: int | None,
+                             discard_tol: float | None) -> tuple[torch.Tensor, torch.Tensor]:
+    '''
+    Choose which boundary indices to keep at the two cuts of the patch.
+
+    `weights[il, ir]` is the weight <psi|P_{il,ir}|psi> of the boundary pair;
+    with the orthogonality center inside the patch these weights sum to one and
+    measure how much of the state each boundary configuration carries.  Indices
+    are ranked by their marginal weight, largest first:
+
+        chi          keep at most this many indices per cut;
+        discard_tol  keep the smallest number whose discarded weight
+                     1 - sum(weights over the kept pairs) is at most this.
+
+    Keeping all indices (both arguments None) reproduces the untruncated
+    projection.  Truncating shrinks the SDP - and, unlike a fixed `chi`, the
+    discarded weight is the quantity that says whether the bounds are still
+    certified: the CGO constraints are only valid if the state lies in the
+    kept subspace.
+    '''
+    D_l, D_r = weights.shape
+    if chi is None and discard_tol is None:
+        return (torch.arange(D_l, device=weights.device),
+                torch.arange(D_r, device=weights.device))
+
+    order_l = torch.argsort(weights.sum(dim=1), descending=True)
+    order_r = torch.argsort(weights.sum(dim=0), descending=True)
+    k_max = min(D_l, D_r, chi) if chi is not None else min(D_l, D_r)
+    k = k_max
+    if discard_tol is not None:
+        total = weights.sum().real
+        for trial in range(1, k_max + 1):
+            kept = weights[order_l[:trial]][:, order_r[:trial]].sum().real
+            if kept >= total - discard_tol:
+                k = trial
+                break
+    return (torch.sort(order_l[:k]).values, torch.sort(order_r[:k]).values)
+
+
 def _product_matrix(state: MPS,
                     lend: int,
                     rend: int,
@@ -210,7 +242,9 @@ def _mpo_commutator_matrix(state: MPS,
     return 1j * (one_sided('right') - one_sided('left'))
 
 
-def _build_cgo_dual(M_samples: list[torch.Tensor], B: torch.Tensor) -> cp.Problem:
+def _build_cgo_dual(M_samples: list[torch.Tensor],
+                    B: torch.Tensor,
+                    constraint_tol: float = 0.0) -> cp.Problem:
     '''
     Build the dual CGO SDP for the upper bound on <B>.
 
@@ -226,6 +260,16 @@ def _build_cgo_dual(M_samples: list[torch.Tensor], B: torch.Tensor) -> cp.Proble
 
     which is the tighter upper bound on <B>.  For the lower bound on <B>,
     build the same problem with -B and negate the result.
+
+    `constraint_tol` >= 0 replaces the equalities by |Tr(rho M_i)| <=
+    constraint_tol.  The CGO constraints are exact only for an exact eigenstate
+    that lies exactly in the patch subspace; a converged DMRG state still leaves
+    the projected state violating them at a small but finite scale (the
+    discarded weight, or sqrt(var(H)) times the size of the commutators).  The
+    equalities are then numerically infeasible and the solvers fail or return a
+    bogus interval.  Relaxing by that scale keeps the bounds valid - the
+    projected state stays feasible and a larger feasible set can only widen the
+    interval - and is what :func:`CGO` does when `constraint_tol=None`.
     '''
     M = [m.detach().cpu().numpy() for m in M_samples]
     M = [0.5 * (m + m.conj().T) for m in M]
@@ -235,7 +279,12 @@ def _build_cgo_dual(M_samples: list[torch.Tensor], B: torch.Tensor) -> cp.Proble
     q = B_np.shape[0]
     rho = cp.Variable((q, q), hermitian=True)
     constraints = [rho >> 0, cp.trace(rho) == 1]
-    constraints += [cp.real(cp.trace(rho @ M[i])) == 0 for i in range(len(M))]
+    if constraint_tol > 0:
+        constraints += [cp.abs(cp.real(cp.trace(rho @ M[i]))) <= constraint_tol
+                        for i in range(len(M))]
+    else:
+        constraints += [cp.real(cp.trace(rho @ M[i])) == 0
+                        for i in range(len(M))]
     return cp.Problem(cp.Maximize(cp.real(cp.trace(rho @ B_np))), constraints)
 
 
@@ -274,7 +323,8 @@ def _solve_bound(dual: cp.Problem,
 
 
 def _solve_cgo_bounds(M_samples: list[torch.Tensor],
-                      B: torch.Tensor) -> tuple[float, float]:
+                      B: torch.Tensor,
+                      constraint_tol: float = 0.0) -> tuple[float, float]:
     '''
     Solve the CGO dual SDPs and return (lower, upper).
 
@@ -283,14 +333,19 @@ def _solve_cgo_bounds(M_samples: list[torch.Tensor],
     cost at the sample counts used here (m = 30).  SCS is kept as a fallback;
     it is first-order and wins for very small m (0.8 s vs 27 s at m = 4), but
     its iteration count grows quickly with m and with the accuracy target.
+
+    `constraint_tol` is forwarded to :func:`_build_cgo_dual`; see there for why
+    the exact equalities are usually infeasible in practice.
     '''
     solver_configs = (
         ('CLARABEL', {}),
         ('SCS', {'eps': 1e-9, 'max_iters': 200000}),
     )
 
-    upper = _solve_bound(_build_cgo_dual(M_samples, B), solver_configs)
-    lower = -_solve_bound(_build_cgo_dual(M_samples, -B), solver_configs)
+    upper = _solve_bound(_build_cgo_dual(M_samples, B, constraint_tol),
+                         solver_configs)
+    lower = -_solve_bound(_build_cgo_dual(M_samples, -B, constraint_tol),
+                          solver_configs)
     return float(lower), float(upper)
 
 
@@ -298,7 +353,11 @@ def CGO_projections(self: Broomstick,
                     l: int,
                     operators: dict[int, torch.Tensor],
                     num_sample: int = 200,
-                    seed: int | None = None
+                    seed: int | None = None,
+                    chi: int | None = None,
+                    discard_tol: float | None = None,
+                    weight_tol: float = 1e-6,
+                    return_info: bool = False
                     ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
     '''
     Build the projected CGO quantities for the observable `operators`.
@@ -314,14 +373,22 @@ def CGO_projections(self: Broomstick,
                    this is the observable B.
         num_sample: number of random anti-Hermitian operators A_i.
         seed: optional RNG seed for the A_i sampling.
+        chi: keep at most this many boundary indices per cut; None keeps all.
+        discard_tol: keep the smallest number of boundary indices per cut whose
+                     discarded state weight is at most this value.
+        weight_tol: warn when the retained subspace holds less than
+                     (1 - weight_tol) of the state weight.
+        return_info: also return a dict with the projection diagnostics.
 
     Returns:
         M_samples: list of r x r projected commutators P_V [H_L,A_i] P_V in the
                    orthonormal basis of V_L, with r the rank of the patch Gram.
         B: r x r projected observable P_V B P_V in the same basis.
         X: basis transformation, |tilde alpha> = sum_beta X[alpha,beta] |beta>,
-           of shape (r, D_l * D_r): the boundary basis is rank deficient, so
-           only r of its directions are kept.
+           of shape (r, q): the boundary basis is rank deficient, so only r of
+           its q directions are kept.  If `return_info` is set, a dict with
+           `q`, `rank`, `chi`, `weight_kept`, `gram_cond` and `x_cond` is
+           returned as a fourth value.
     '''
     if not all(op.shape == (self.physical_dim, self.physical_dim)
                for op in operators.values()):
@@ -378,16 +445,74 @@ def CGO_projections(self: Broomstick,
     B_full = weight * B_raw
     M_full = [weight * M for M in M_raw]
 
+    # ── keep only the most important boundary indices, when asked to ──
+    #
+    # weights[il, ir] = <psi|P_{il,ir}|psi> is how much of the state the
+    # boundary pair (il, ir) carries; the sum over all pairs is <psi|psi>.  The
+    # kept weight is the share of the state that still lies in the retained
+    # subspace, i.e. the share for which the CGO constraints remain valid.
+    ones = torch.ones(opti_dim, dtype=gram.dtype, device=gram.device)
+    overlaps = (gram.reshape(opti_dim, opti_dim).conj() @ ones)
+    weights = torch.diagonal(
+        gram.reshape(opti_dim, opti_dim)).real.reshape(D_l, D_r)
+    keep_l, keep_r = _select_boundary_indices(weights, chi, discard_tol)
+    if len(keep_l) != D_l or len(keep_r) != D_r:
+        sel = (keep_l[:, None] * D_r + keep_r[None, :]).reshape(-1)
+        overlaps = overlaps[sel]
+
+        def restrict(T: torch.Tensor) -> torch.Tensor:
+            return T[keep_l][:, keep_r][:, :, keep_l][:, :, :, keep_r]
+
+        gram = restrict(gram)
+        B_full = restrict(B_full)
+        M_full = [restrict(M) for M in M_full]
+
     # ── orthonormalize the boundary-state basis and transform the operators ──
     #
     # gram[alpha, beta] = <beta|alpha> = H^T, where H[alpha, beta] =
     # <alpha|beta> is the usual Gram matrix; since H is Hermitian, conj(gram) =
-    # H.  The basis is rank deficient, so X has shape (r, D_l * D_r).
+    # H.  The basis is rank deficient, so X has shape (r, q).
     X = _orthonormal_transform(gram)
-    M_samples = [X @ M.reshape(opti_dim, opti_dim) @ X.conj().T
-                 for M in M_full]
-    B = X @ B_full.reshape(opti_dim, opti_dim) @ X.conj().T
-    return M_samples, B, X
+    q = X.shape[1]
+    M_samples = [X @ M.reshape(q, q) @ X.conj().T for M in M_full]
+    B = X @ B_full.reshape(q, q) @ X.conj().T
+
+    # ||P_V|psi>||^2: the share of the state inside the retained subspace.
+    psi = X @ overlaps
+    kept_weight = float(torch.linalg.norm(psi) ** 2)
+    if kept_weight < 1 - weight_tol:
+        warnings.warn(
+            f'CGO: the retained patch subspace holds only {kept_weight:.12f} '
+            f'of the state weight (discarded {1 - kept_weight:.3e} > '
+            f'weight_tol = {weight_tol:.1e}); the CGO constraints are then not '
+            f'satisfied by the state and the bounds are not certified. '
+            f'Raise chi / discard_tol, or converge the state.'
+        )
+    if not return_info:
+        return M_samples, B, X
+
+    # How badly the projected state itself violates the CGO constraints.  It is
+    # zero only for an exact eigenstate inside an untruncated patch subspace, so
+    # this is the scale by which `CGO` relaxes the equalities when asked to
+    # choose the relaxation automatically.
+    violation = max(abs(complex(psi.conj() @ (M @ psi)) / kept_weight)
+                    for M in M_samples) if M_samples else 0.0
+
+    evals = torch.linalg.eigvalsh(0.5 * (gram.reshape(q, q)
+                                         + gram.reshape(q, q).conj().T))
+    evals = evals.double()
+    positive = evals[evals > 1e-14 * evals.max()]
+    svals = torch.linalg.svdvals(X)
+    info = {
+        'q': q,
+        'rank': int(X.shape[0]),
+        'chi': (int(len(keep_l)), int(len(keep_r))),
+        'weight_kept': kept_weight,
+        'constraint_violation': float(violation),
+        'gram_cond': float(evals.max() / positive.min()),
+        'x_cond': float(svals.max() / svals.min()),
+    }
+    return M_samples, B, X, info
 
 
 @extends_Broomstick
@@ -395,9 +520,21 @@ def CGO(self: Broomstick,
         l: int,
         operators: dict[int, torch.Tensor],
         num_sample: int = 200,
-        seed: int | None = None) -> tuple[float, float]:
+        seed: int | None = None,
+        chi: int | None = None,
+        discard_tol: float | None = None,
+        weight_tol: float = 1e-6,
+        constraint_tol: float | None = 0.0,
+        validate: bool = False) -> tuple[float, float]:
     '''
     Compute CGO upper and lower bounds for <B> in a 1d DMRG state.
+
+    The bounds are certified only as far as the CGO constraints hold for the
+    state: they require the state to lie in the patch subspace V_L, and they
+    require the state to be an eigenstate of H.  `weight_tol` guards the first
+    (the part of the state weight thrown away by `chi`/`discard_tol`, or by the
+    rank truncation of a rank-deficient Gram), `validate` the second (through
+    sqrt(var(H)), the norm of (H - E)|psi>).
 
     Args:
         l: radius of the patch L = [lend, rend) around the observable.
@@ -405,11 +542,56 @@ def CGO(self: Broomstick,
                    this is the observable B.
         num_sample: number of random anti-Hermitian operators A_i.
         seed: optional RNG seed for the A_i sampling.
+        chi: keep at most this many boundary indices per cut; None keeps all.
+        discard_tol: keep the smallest number of boundary indices per cut whose
+                     discarded state weight is at most this value.
+        weight_tol: the kept state weight must reach 1 - weight_tol, otherwise
+                    a warning says the bounds are not certified.
+        constraint_tol: how far the projected state may miss the CGO
+                    constraints Tr(rho [H_L, A_i]) = 0.  Pass a positive number
+                    to enforce |Tr(rho M_i)| <= constraint_tol, or None to pick
+                    the relaxation automatically from the violation the
+                    projected state itself shows (see `CGO_projections`), which
+                    keeps that state inside the feasible set.  0.0, the default,
+                    restores the exact equalities; they are only satisfiable by
+                    an exact eigenstate in an untruncated patch subspace and
+                    otherwise make the SDP infeasible, so prefer None whenever
+                    the exact form fails to solve.
+        validate: also check sqrt(var(H)) against `weight_tol`.
 
     Returns:
         (lower, upper): bounds on <B>.
     '''
-    M_samples, B, _ = CGO_projections(
-        self, l=l, operators=operators, num_sample=num_sample, seed=seed
-    )
-    return _solve_cgo_bounds(M_samples, B)
+    if constraint_tol is None:
+        M_samples, B, _, info = CGO_projections(
+            self, l=l, operators=operators, num_sample=num_sample, seed=seed,
+            chi=chi, discard_tol=discard_tol, weight_tol=weight_tol,
+            return_info=True,
+        )
+        # A hair above the state's own violation, so that the projected state is
+        # strictly inside the relaxed feasible set.
+        constraint_tol = 1.01 * info['constraint_violation'] + 1e-12
+    else:
+        M_samples, B, _ = CGO_projections(
+            self, l=l, operators=operators, num_sample=num_sample, seed=seed,
+            chi=chi, discard_tol=discard_tol, weight_tol=weight_tol,
+        )
+    if validate:
+        deviation = math.sqrt(max(self.compute_variance(), 0.0))
+        if deviation > weight_tol:
+            warnings.warn(
+                f'CGO: sqrt(var(H)) = {deviation:.3e} > weight_tol = '
+                f'{weight_tol:.1e}; the state is not an eigenstate of H, so '
+                f'the constraints are violated at that scale and the bounds '
+                f'are not certified.'
+            )
+    rank = B.shape[0]
+    estimated = 16.0 * rank ** 4
+    if estimated > 2e9:
+        warnings.warn(
+            f'CGO: the projected SDP has rank {rank}; the solver needs roughly '
+            f'{estimated / 1e9:.1f} GB for its normal-equation matrix.  Pass '
+            f'chi=<n> or discard_tol=<tol> to shrink the patch subspace '
+            f'(the paper keeps 6 boundary indices per cut).'
+        )
+    return _solve_cgo_bounds(M_samples, B, constraint_tol)
