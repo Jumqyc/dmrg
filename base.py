@@ -6,6 +6,7 @@ import pickle as pkl
 from math import sqrt
 from typing import Literal
 from numpy.typing import NDArray
+from torch import Tensor
 from opt_einsum import contract_expression
 
 # ---------------------------------------------------------------------------
@@ -16,7 +17,7 @@ from opt_einsum import contract_expression
 # ---------------------------------------------------------------------------
 _expr_cache: dict = {}
 
-def cached_einsum(einsum_str: str, *tensors: torch.Tensor) -> torch.Tensor:
+def cached_einsum(einsum_str: str, *tensors: Tensor) -> Tensor:
     """Perform an einsum contraction using a cached ``ContractExpression``."""
     shapes = tuple(t.shape for t in tensors)
     key = (einsum_str,) + shapes
@@ -72,7 +73,7 @@ class MPS:
                  L: int,
                  phys_dim:int,
                  bond_dims:list[int]|None = None,
-                 init_state:list[torch.Tensor]|None = None,
+                 init_state:list[Tensor]|None = None,
                  dtype:torch.dtype = torch.complex128,
                  device:torch.device = torch.device('cuda')):
         '''
@@ -80,7 +81,7 @@ class MPS:
             L (int): Length of the MPS (number of sites).
             phys_dim (int): Physical dimension of each site.
             bond_dims (list[int] | None): List of bond dimensions for each bond in the MPS. Including the left and right virtual bonds, the length of this list should be L+1. If None, defaults to [1] + [phys_dim] * (L - 1) + [1].
-            init_state (list[torch.Tensor] | None): Optional initial state for the MPS. If None, random tensors will be generated.
+            init_state (list[Tensor] | None): Optional initial state for the MPS. If None, random tensors will be generated.
             dtype (torch.dtype): Data type for the MPS tensors (default: torch.complex128).
             device (torch.device): Device to store the MPS tensors (default: 'cuda').
         Raises:
@@ -145,11 +146,11 @@ class MPS:
     def expectation(self,operators, mode:Literal['direct','env'] = 'env')-> complex:
         '''
         Compute the expectation value of operators on the MPS.
-        Accepts either a dict[int, torch.Tensor] of single-site operators or an MPO.
+        Accepts either a dict[int, Tensor] of single-site operators or an MPO.
 
         To compute the norm, just pass {} as the operator list.
         Args:
-            operators: dict[int, torch.Tensor] | MPO: A dictionary of operators to compute the expectation value,
+            operators: dict[int, Tensor] | MPO: A dictionary of operators to compute the expectation value,
                        or an MPO representing a full matrix product operator.
             mode: 'direct' or 'env' — contraction strategy (for dict operators only; MPO always uses direct).
         Returns:
@@ -160,7 +161,7 @@ class MPS:
         # Check if operators is an MPO instance (imported locally to avoid circular refs)
         if type(operators).__name__ == 'MPO':
             return self._mpo_expectation(operators)
-        # Otherwise treat as dict[int, torch.Tensor]
+        # Otherwise treat as dict[int, Tensor]
         if any(op.shape != (self.phys_dim, self.phys_dim) for op in operators.values()):
             raise ValueError(f"Operator shapes do not match the physical dimension {self.phys_dim}.")
         elif any(idx < 0 or idx >= self.L for idx in operators.keys()):
@@ -200,7 +201,7 @@ class MPS:
         return lenv[0, 0, -1].item()
 
     @torch.no_grad()
-    def _full_dir_contract(self,operators:dict[int,torch.Tensor]):
+    def _full_dir_contract(self,operators:dict[int,Tensor]):
         '''
         Brute-force contraction of the MPS with the given operators to compute the expectation value.
         '''
@@ -219,7 +220,7 @@ class MPS:
 
 
     @torch.no_grad()
-    def _full_env_contract(self, operators: dict[int, torch.Tensor]):
+    def _full_env_contract(self, operators: dict[int, Tensor]):
         '''
         Compute the expectation value of a list of operators on the MPS using the canonical form.
         '''
@@ -357,21 +358,21 @@ class MPO:
     def __init__(self,
                  L:int,
                  phys_dim:int,
-                 mapping:dict[str,torch.Tensor]|None = None,
+                 mapping:dict[str,Tensor]|None = None,
                  dtype:torch.dtype = torch.complex128,
                  device:torch.device = torch.device('cuda')):
         '''
         Args:
             L (int): Length of the MPO (number of sites).
             phys_dim (int): Physical dimension of the MPO.
-            mapping (dict[str, torch.Tensor]): A dictionary mapping operator names to their corresponding torch.Tensor representations. If None, default mappings will be used.
+            mapping (dict[str, Tensor]): A dictionary mapping operator names to their corresponding Tensor representations. If None, default mappings will be used.
         '''
         self.dtype = dtype
         self.device = device
         self.L = L
         self.couplings: list[tuple[tuple[str, ...], complex, tuple[int, ...]]] = []
         self.physical_dim = phys_dim
-        self.tensors: list[torch.Tensor] = []
+        self.tensors: list[Tensor] = []
         self.bond_dim = 0
 
         if mapping is None:
@@ -697,8 +698,8 @@ class Broomstick:
 
     def cache_envs(self):
         L = self.L
-        self.renv: list['torch.Tensor'] = [None] * (L + 1)
-        self.lenv: list['torch.Tensor'] = [None] * (L + 1)
+        self.renv: list['Tensor'] = [None] * (L + 1)
+        self.lenv: list['Tensor'] = [None] * (L + 1)
 
         # Right boundary environment: MPO bond dim = Hamiltonian.bond_dim, final state (D-1) set to 1
         self.renv[L] = torch.zeros(1, self.Hamiltonian.bond_dim, 1,
@@ -831,8 +832,8 @@ class Broomstick:
     @torch.no_grad()
     def _lanczos(self,
                  i: int,
-                 v0: torch.Tensor,
-                 n_iter: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
+                 v0: Tensor,
+                 n_iter: int = 8) -> tuple[Tensor, Tensor]:
         v0 = v0 / torch.linalg.norm(v0)
 
         vecs = torch.zeros((n_iter + 1, *v0.shape), dtype=v0.dtype, device=v0.device)
@@ -846,7 +847,7 @@ class Broomstick:
         renv = cached_einsum('crd,qrkl->cdqkl',
                             self.renv[i + 2],
                             self.Hamiltonian.tensors[i + 1])
-        def helper(v: torch.Tensor) -> torch.Tensor:
+        def helper(v: Tensor) -> Tensor:
             return cached_einsum('abqij,cdqkl,bjld->aikc', lenv, renv, v)
     
         vecs[0] = v0
@@ -884,7 +885,7 @@ class Broomstick:
 
         return E0, v_ground
 
-    def update(self, direction: Literal['left', 'right'], n_iter: int = 8) -> tuple['torch.Tensor', 'torch.Tensor']:
+    def update(self, direction: Literal['left', 'right'], n_iter: int = 8) -> tuple['Tensor', 'Tensor']:
         '''
         Perform 2-site optimization of MPS with effective Hamiltonian.
         Returns (energy_tensor, truncation_error_tensor) — both are 0-d GPU

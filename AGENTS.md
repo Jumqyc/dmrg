@@ -1,0 +1,51 @@
+# AGENTS.md
+
+This repository's agents must follow these rules.
+
+## 1. Permission-first workflow
+
+When asked to do something:
+
+- First search the codebase for possible existing implementations.
+- Do not immediately edit or create code.
+- Discuss with the user what should be done, including options and tradeoffs.
+- Seek explicit permission before proceeding.
+- Only implement after permission is granted.
+
+## 2. Python annotation and comment syntax
+
+Follow the workplace coding syntax:
+
+- Use Python type annotations.
+- After each `def ...:` signature, write a short comment describing the logic and API of the code.
+
+Example:
+
+```python
+def compute_score(x: Tensor, y: Tensor) -> Tensor:
+    # Logic: compute the elementwise score between x and y.
+    # API: returns a Tensor with the same shape as x and y.
+    ...
+```
+
+## 3. Always use CUDA for matrix computation
+
+Always use CUDA for matrix computation.
+
+- Move matrices/tensors to CUDA before matrix operations.
+- Use CUDA-backed matrix operations.
+- Do not use CPU matrix computation unless explicitly permitted.
+
+## 4. Do not overdesign
+
+Do not overdesign unless specified.
+
+- Keep the code as simple as possible to pass the test.
+- Add abstractions, configuration, or extensibility only when additional requirements are planned.
+
+## 5. Inline one-off logic
+
+For variables or functions that are only used once or twice, inline the related logic.
+
+- Avoid unnecessary helper functions or intermediate variables for single-use or double-use cases.
+- Prefer direct, local logic unless reuse or clarity justifies extraction.
