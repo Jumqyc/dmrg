@@ -2,5 +2,5 @@
 __pycache__/
 profiling/
 tmp/
-
-push.sh
+build/
+FreeFermion/cuda/build/

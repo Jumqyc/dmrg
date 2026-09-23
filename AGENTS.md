@@ -23,8 +23,16 @@ Example:
 
 ```python
 def compute_score(x: Tensor, y: Tensor) -> Tensor:
-    # Logic: compute the elementwise score between x and y.
-    # API: returns a Tensor with the same shape as x and y.
+    '''
+    <Here describe the logic of the code>
+    Args:
+       <Here describe the inputs>
+    Returns:
+      <Here describe the returns>
+    Raises:
+      <If raises any error > 
+    In the comment describe the shape of the tensor.  
+    '''  
     ...
 ```
 

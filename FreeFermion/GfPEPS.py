@@ -1,10 +1,21 @@
+import os
+import sys
+
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from torch import Tensor
 from dataclasses import dataclass
 
+from base import CUDA
+from FreeFermion.linalg import randcov
+
 '''
-Based on arxiv:2012.04666: Gaussian fermionic PEPS (GfPEPS) on arbitrary graphs.
+Based on arxiv:2012.04666: C.-M. Jian, B. Bauer, A. Keselman and A. W. W. Ludwig,
+"Criticality and entanglement in non-unitary quantum circuits and tensor networks
+of non-interacting fermions", Phys. Rev. B 106, 054309 (2022), Sec. III:
+fermionic Gaussian tensor networks.
 
 A node carries ``dim_of_node(node)`` Majorana modes and is described by its
 covariance matrix ``Gamma_ij = < i/2 [gamma_i, gamma_j] >`` (Eq. (2) of the
@@ -16,7 +27,7 @@ pure Gaussian state. The modes of a node are ordered as
 where the bond blocks follow the order of ``graph.edges``. A bond pairs the
 k-th mode of the block at its first end with the k-th mode of the block at its
 second end and is contracted with the projector
-``prod_k (1 + i gamma_k upsilon_k)/2`` (Sec. III.2 of the reference).
+``prod_k (1 + i gamma_k upsilon_k)/2`` (Sec. III.2 of the reference, Eq. (9)).
 '''
 
 @dataclass(frozen=True, order=True)
@@ -65,32 +76,12 @@ class Graph:
         return sorted({bond.other(node) for bond in self.edges
                        if node in (bond.first, bond.second)})
 
-def randcov(dim:int,
-            dtype:torch.dtype = torch.float64,
-            device:torch.device = torch.device('cuda'))->Tensor:
-    '''
-    Generate a random real matrix G of shape (dim, dim) (dim is even) such that G is antisymmetric and satisfies G^2 = -I.
-    The orthogonal factor is drawn from the Haar measure and J is the symplectic form.
-    '''
-    if dim % 2 != 0:
-        raise ValueError("Dimension must be even.")
-    a = torch.randn(dim, dim, dtype=dtype, device=device)
-    q,r = torch.linalg.qr(a)
-    q = q @ torch.diag(torch.sign(torch.diagonal(r)))
-
-    j = torch.zeros((dim, dim), dtype=dtype, device=device)
-    j[:dim//2, dim//2:] = -torch.eye(dim//2, dtype=dtype, device=device)
-    j[dim//2:, :dim//2] = torch.eye(dim//2, dtype=dtype, device=device)
-
-    return q @ j @ q.T
-
-
 class GfPEPS:
     def __init__(self, 
                  graph: Graph,
                  ext_dim: list[int],
                  dtype: torch.dtype = torch.float64,
-                 device: torch.device = torch.device('cuda')):
+                 device: torch.device = CUDA):
         '''
         graph: An instance of the Graph class representing the structure of the system.
         ext_dim: A list of integers representing the external dimensions for each node.
@@ -154,8 +145,9 @@ class GfPEPS:
         Contract the sites i and j into a single site and fuse its bonds.
 
         Parallel bonds are fused first, so i and j are joined by a single bond
-        with ``chi`` Majorana modes, which is contracted with Eq. (9) of
-        arXiv:2012.04666. The sites are then merged into one, keeping the external
+        with ``chi`` Majorana modes, which is contracted with Eq. (9) of the
+        reference (Jian-Bauer-Keselman-Ludwig, Phys. Rev. B 106, 054309 (2022),
+        arXiv:2012.04666). The sites are then merged into one, keeping the external
         modes of both:
 
           1. contract the bond between i and j into ``psi``, which carries the
@@ -315,7 +307,7 @@ class GfPEPO:
                  ext_dim_in: list[int],
                  ext_dim_out: list[int],
                  dtype: torch.dtype = torch.float64,
-                 device: torch.device = torch.device('cuda')):
+                 device: torch.device = CUDA):
         '''
         graph: An instance of the Graph class representing the structure of the system.
         ext_dim_in: A list of integers representing the external dimensions for each node.
