@@ -192,6 +192,18 @@ def _mode_coefficients(coeff: Tensor, num_modes: int, operator: tuple) -> Tensor
     codes = torch.tensor([[kinds.get(operator[0], 2), operator[1]]],
                          dtype=torch.long, device=coeff.device)
     return fermion.operator_vectors(coeff, codes)[0]
+    # Pure Python reference, kept as a comment (this is what the CUDA kernel above
+    # replaces; it is the implementation that was here before the kernel):
+    # vector = torch.zeros(2 * num_modes, dtype=DTYPE, device=coeff.device)
+    # kind = operator[0]
+    # if kind == 'd':
+    #     vector[operator[1]] = 1.0
+    # elif kind == 'c':
+    #     vector[num_modes + operator[1]] = 1.0
+    # else:
+    #     vector[:num_modes] = 2.0 * coeff[:, operator[1]].conj()
+    #     vector[num_modes:] = 2.0 * coeff[:, operator[1]]
+    # return vector
 
 
 def _vacuum_contraction(vectors: list[Tensor], num_modes: int) -> Tensor:
@@ -212,3 +224,13 @@ def _vacuum_contraction(vectors: list[Tensor], num_modes: int) -> Tensor:
         The complex antisymmetric contraction matrix, shape (m, m).
     '''
     return fermion.vacuum_contraction(torch.stack(vectors).unsqueeze(0), num_modes)[0]
+    # Pure Python reference, kept as a comment (this is what the CUDA kernel above
+    # replaces; it is the implementation that was here before the kernel):
+    # size = len(vectors)
+    # matrix = torch.zeros((size, size), dtype=DTYPE, device=vectors[0].device)
+    # for i in range(size):
+    #     for j in range(i + 1, size):
+    #         value = torch.sum(vectors[i][:num_modes] * vectors[j][num_modes:])
+    #         matrix[i, j] = value
+    #         matrix[j, i] = -value
+    # return matrix
