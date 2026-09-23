@@ -11,8 +11,6 @@ L = 30
 MAXBONDDIM = 256
 
 def heisenberg():
-
-    # ── Heisenberg model ────────────────────────────────────────────────────
     mps = MPS(L, phys_dim=2)
     heisenberg_mpo = MPO(L, phys_dim=2)
 
@@ -31,7 +29,6 @@ def heisenberg():
 
 
 def ising():
-    # ── Ising model ─────────────────────────────────────────────────────────
     ising_mps = MPS(L, phys_dim=2)
     ising_mpo = MPO(L, phys_dim=2)
 
@@ -50,7 +47,6 @@ def ising():
     del ising
 
 def vbs():
-    # ── VBS model ───────────────────────────────────────────────────────────
     vbs_mps = MPS(L, phys_dim=2)
     vbs_mpo = MPO(L, phys_dim=2)
 
@@ -72,12 +68,8 @@ def vbs():
     print("VBS model done. Expected energy density: −0.375")
 
 def aklt():
-    # ── AKLT model (spin-1, exact VBS ground state, E=0) ────────────────────
-
-
     phys_dim = 3
 
-    # Spin-1 operators
     S1 = SpinOperator(phys_dim).data  # [Sx, Sy, Sz]
     Sx, Sy, Sz = S1[0], S1[1], S1[2]
     I3 = torch.eye(phys_dim, dtype=torch.complex128, device='cuda')

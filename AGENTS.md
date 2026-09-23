@@ -24,9 +24,9 @@ Example:
 ```python
 def compute_score(x: Tensor, y: Tensor) -> Tensor:
     '''
-    <Here describe the logic of the code>
+    <Here describe the logic of the code (no need to add Logic: xxx)>
     Args:
-       <Here describe the inputs>
+      <Here describe the inputs>
     Returns:
       <Here describe the returns>
     Raises:

@@ -39,15 +39,42 @@ from base import CUDA, DTYPE
 from FreeFermion.cuda import fermion
 
 
+def vacuum_covariance(num_modes: int,
+                      dtype: torch.dtype = torch.float64,
+                      device: torch.device = CUDA) -> Tensor:
+    '''
+    covariance of the vacuum of num_modes Majorana modes, i.e. of the state
+    whose normal modes are all empty and whose Williamson eigenvalues are all 1:
+    the adjacent Majorana pairs (gamma_2k, gamma_2k+1) are paired with J.  This is
+    the block diagonal form that randcov conjugates and that the bond blocks of a
+    product state use.
+    Args:
+        num_modes: number of Majorana modes, even.
+        dtype: dtype of the returned matrix.
+        device: device of the returned matrix, CUDA by default.
+    Returns:
+        The real antisymmetric matrix J of shape (num_modes, num_modes), with
+        J @ J = -1.
+    Raises:
+        ValueError: if num_modes is odd.
+    '''
+    if num_modes % 2 != 0:
+        raise ValueError("The number of Majorana modes must be even.")
+    j = torch.zeros((num_modes, num_modes), dtype=dtype, device=device)
+    j[0::2, 1::2] = -torch.eye(num_modes // 2, dtype=dtype, device=device)
+    j[1::2, 0::2] = torch.eye(num_modes // 2, dtype=dtype, device=device)
+    return j
+
+
 def randcov(dim: int,
             dtype: torch.dtype = torch.float64,
             device: torch.device = CUDA) -> Tensor:
     '''
-    Logic: random pure Gaussian covariance of dim Majorana modes: an orthogonal q
+    random pure Gaussian covariance of dim Majorana modes: an orthogonal q
     drawn from the Haar measure (the Q factor of a Gaussian matrix, with the signs
-    of R fixed) conjugates the block diagonal symplectic form J, whose 2x2 blocks
-    [[0, -1], [1, 0]] pair the adjacent Majoranas (gamma_2k, gamma_2k+1) exactly
-    as D of williamson_decomposition does.
+    of R fixed) conjugates the vacuum covariance J, whose 2x2 blocks [[0, -1],
+    [1, 0]] pair the adjacent Majoranas (gamma_2k, gamma_2k+1) exactly as D of
+    williamson_decomposition does.
     Args:
         dim: number of Majorana modes, even.
         dtype: dtype of the returned matrix.
@@ -64,16 +91,12 @@ def randcov(dim: int,
     q,r = torch.linalg.qr(a)
     q = q @ torch.diag(torch.sign(torch.diagonal(r)))
 
-    j = torch.zeros((dim, dim), dtype=dtype, device=device)
-    j[0::2, 1::2] = -torch.eye(dim//2, dtype=dtype, device=device)
-    j[1::2, 0::2] = torch.eye(dim//2, dtype=dtype, device=device)
-
-    return q @ j @ q.T
+    return q @ vacuum_covariance(dim, dtype, device) @ q.T
 
 
 def williamson_decomposition(gamma: Tensor) -> tuple[Tensor, Tensor]:
     '''
-    Logic: Williamson normal form of the covariance gamma, from the Hermitian
+    Williamson normal form of the covariance gamma, from the Hermitian
     A = i gamma.  eigh returns the eigenvalues ascending in +-lambda_k pairs, so
     the last n columns are the eigenvectors w_k of the positive lambda_k.  The
     sqrt(2) in (sqrt(2) Re w_k, sqrt(2) Im w_k) is exactly the factor that makes
@@ -107,7 +130,7 @@ def williamson_decomposition(gamma: Tensor) -> tuple[Tensor, Tensor]:
 def williamson_modes(gamma: Tensor,
                      tolerance: float = 1e-10) -> tuple[Tensor, Tensor]:
     '''
-    Logic: normal modes d_k of the Gaussian state with covariance gamma.  The row
+    normal modes d_k of the Gaussian state with covariance gamma.  The row
     pair (2k, 2k + 1) of R is (sqrt(2) Re w_k, sqrt(2) Im w_k), hence
     d_k = (1/2) sum_mu (R[2k] + i R[2k + 1])_mu gamma_mu, normalised so that
     {d_k, d_l^dag} = delta_kl and <d_k^dag d_l> = p_k delta_kl with
@@ -134,7 +157,7 @@ def williamson_modes(gamma: Tensor,
 def williamson_modular(gamma: Tensor,
                        clip: float = 1e-12) -> tuple[Tensor, Tensor]:
     '''
-    Logic: modular matrix W = -2i artanh(i gamma) of the thermal form
+    modular matrix W = -2i artanh(i gamma) of the thermal form
     rho = exp((i/4) gamma^T W gamma) / Z.  artanh is a matrix function, so it is
     the same similarity transform as the decomposition with the block values
     artanh(lambda_k): W = 2 R^T D' R.  Eigenvalues at the purity boundary are
@@ -158,7 +181,7 @@ def williamson_modular(gamma: Tensor,
 
 def pfaffian(matrix: Tensor) -> Tensor:
     '''
-    Logic: Pfaffian of an antisymmetric matrix by skew-symmetric elimination with
+    Pfaffian of an antisymmetric matrix by skew-symmetric elimination with
     two-by-two pivots, Pf(A) = A[0,1] * Pf(Schur complement) with the sign of the
     pivoting permutation tracked; an odd-sized matrix has no pairing and gives 0.
     Kernel: already covered by CUDA in FreeFermion/cuda/fermion.cu (function pfaffian, one
@@ -173,7 +196,7 @@ def pfaffian(matrix: Tensor) -> Tensor:
 
 def _mode_coefficients(coeff: Tensor, num_modes: int, operator: tuple) -> Tensor:
     '''
-    Logic: a linear operator (a mode annihilation, a mode creation or a physical
+    a linear operator (a mode annihilation, a mode creation or a physical
     Majorana) as a vector over the 2*num_modes mode operators
     [d_0 ... d_{n-1}, d_0^dag ... d_{n-1}^dag]; a physical Majorana is
     gamma_mu = sum_k (2 conj(coeff[k, mu]) d_k + 2 coeff[k, mu] d_k^dag).
@@ -192,23 +215,11 @@ def _mode_coefficients(coeff: Tensor, num_modes: int, operator: tuple) -> Tensor
     codes = torch.tensor([[kinds.get(operator[0], 2), operator[1]]],
                          dtype=torch.long, device=coeff.device)
     return fermion.operator_vectors(coeff, codes)[0]
-    # Pure Python reference, kept as a comment (this is what the CUDA kernel above
-    # replaces; it is the implementation that was here before the kernel):
-    # vector = torch.zeros(2 * num_modes, dtype=DTYPE, device=coeff.device)
-    # kind = operator[0]
-    # if kind == 'd':
-    #     vector[operator[1]] = 1.0
-    # elif kind == 'c':
-    #     vector[num_modes + operator[1]] = 1.0
-    # else:
-    #     vector[:num_modes] = 2.0 * coeff[:, operator[1]].conj()
-    #     vector[num_modes:] = 2.0 * coeff[:, operator[1]]
-    # return vector
 
 
 def _vacuum_contraction(vectors: list[Tensor], num_modes: int) -> Tensor:
     '''
-    Logic: the Wick contraction matrix with K[i, j] = <0|A_i A_j|0> for i < j and
+    the Wick contraction matrix with K[i, j] = <0|A_i A_j|0> for i < j and
     K[j, i] = -K[i, j].  In the mode vacuum the only non-zero contraction of the
     mode operators is <0|d_k d_l^dag|0> = delta_kl, so
     <0|A_i A_j|0> = sum_k a_i[d_k] a_j[d_k^dag]; the matrix is then
@@ -224,13 +235,56 @@ def _vacuum_contraction(vectors: list[Tensor], num_modes: int) -> Tensor:
         The complex antisymmetric contraction matrix, shape (m, m).
     '''
     return fermion.vacuum_contraction(torch.stack(vectors).unsqueeze(0), num_modes)[0]
-    # Pure Python reference, kept as a comment (this is what the CUDA kernel above
-    # replaces; it is the implementation that was here before the kernel):
-    # size = len(vectors)
-    # matrix = torch.zeros((size, size), dtype=DTYPE, device=vectors[0].device)
-    # for i in range(size):
-    #     for j in range(i + 1, size):
-    #         value = torch.sum(vectors[i][:num_modes] * vectors[j][num_modes:])
-    #         matrix[i, j] = value
-    #         matrix[j, i] = -value
-    # return matrix
+
+
+def occupations(covariance: Tensor) -> Tensor:
+    '''
+    Williamson occupations p_k = (1 - lambda_k) / 2 of a covariance, with
+    the lambda_k the positive eigenvalues of i Gamma.
+    Args:
+        covariance: real antisymmetric covariance of 2n Majorana modes.
+    Returns:
+        The occupation of every normal mode, shape (n,), in [0, 1].
+    '''
+    eigenvalues = torch.linalg.eigvalsh(1j * covariance.to(torch.complex128)).real
+    return (1.0 - eigenvalues[eigenvalues.shape[0] // 2:]) / 2.0
+
+
+def purity(covariance: Tensor) -> float:
+    '''
+    purity Tr(rho^2) of a Gaussian state, the product of the binary purities
+    of its normal modes: 1 for a pure state and 2**-n for the maximally mixed one.
+    Args:
+        covariance: real antisymmetric covariance of 2n Majorana modes.
+    Returns:
+        The purity in (0, 1].
+    '''
+    p = occupations(covariance)
+    return float((p * p + (1.0 - p) * (1.0 - p)).prod())
+
+
+def entropy(covariance: Tensor) -> float:
+    '''
+    von Neumann entropy of a Gaussian state, the sum of the binary entropies
+    of its normal modes.
+    Args:
+        covariance: real antisymmetric covariance of 2n Majorana modes.
+    Returns:
+        The entropy in nats, 0 for a pure state.
+    '''
+    p = occupations(covariance).clamp(1e-15, 1.0 - 1e-15)
+    return float(-(p * p.log() + (1.0 - p) * (1.0 - p).log()).sum())
+
+
+def is_pure(covariance: Tensor, tolerance: float = 1e-9) -> bool:
+    '''
+    test the pure-state condition Gamma^2 = -1.
+    Args:
+        covariance: real antisymmetric covariance of 2n Majorana modes.
+        tolerance: largest max |Gamma^2 + 1| accepted as pure.
+    Returns:
+        True if the covariance is that of a pure state.
+    '''
+    identity = torch.eye(covariance.shape[0], dtype=covariance.dtype, device=covariance.device)
+    return float((covariance @ covariance + identity).abs().max()) < tolerance
+

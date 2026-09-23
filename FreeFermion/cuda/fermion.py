@@ -41,7 +41,7 @@ else:
 
 def operator_vectors(coeff: Tensor, codes: Tensor) -> Tensor:
     '''
-    Logic: batched mode-basis vectors of a list of operators (FreeFermion/cuda/fermion.cu):
+    Batched mode-basis vectors of a list of operators (FreeFermion/cuda/fermion.cu):
     kind 0 gives the unit vector of d_k, kind 1 the unit vector of d_k^dag and
     kind 2 the inverse expansion of the physical Majorana gamma_mu.
     Args:
@@ -58,7 +58,7 @@ def operator_vectors(coeff: Tensor, codes: Tensor) -> Tensor:
 
 def vacuum_contraction(vectors: Tensor, num_modes: int) -> Tensor:
     '''
-    Logic: batched Wick contraction matrices K_ij = <0|A_i A_j|0> (FreeFermion/cuda/fermion.cu):
+    Batched Wick contraction matrices K_ij = <0|A_i A_j|0> (FreeFermion/cuda/fermion.cu):
     the sum of the first half of a_i with the second half of a_j, upper triangle
     kept and antisymmetrised.
     Args:
@@ -72,7 +72,7 @@ def vacuum_contraction(vectors: Tensor, num_modes: int) -> Tensor:
 
 def pfaffian(matrices: Tensor) -> Tensor:
     '''
-    Logic: batched Pfaffian by skew-symmetric elimination with two-by-two pivots
+    Batched Pfaffian by skew-symmetric elimination with two-by-two pivots
     (FreeFermion/cuda/fermion.cu), one block per matrix; a matrix without a pivot candidate
     gives 0, an odd size gives 0 and size 0 gives 1.
     Args:
