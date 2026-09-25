@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dmrg"
+version = "0.1.0"
+description = "free-fermion, Gaussian tensor network and CGO routines of this repository"
+requires-python = ">=3.12"
+
+# the repository root holds two top level modules and two namespace packages, so
+# an editable install of this file is what puts the root on sys.path
+[tool.setuptools]
+py-modules = ["base", "ext_register"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+namespaces = true
+include = ["FreeFermion*", "CGO*"]
+exclude = ["FreeFermion.cuda.build*"]
+
+[tool.setuptools.package-data]
+"FreeFermion.cuda" = ["*.cu"]

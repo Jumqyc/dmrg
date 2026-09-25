@@ -31,10 +31,15 @@ def compute_score(x: Tensor, y: Tensor) -> Tensor:
       <Here describe the returns>
     Raises:
       <If raises any error > 
-    In the comment describe the shape of the tensor.  
     '''  
     ...
 ```
+
+- In the comment describe the shape of the tensor, or other requirement (Hermitian, Unitary, anti-Hermitian, etc.).
+
+- Use latex format for equations. Use r-string if latex is included. 
+
+- Keep the logic in one line 
 
 ## 3. Always use CUDA for matrix computation
 

@@ -4,7 +4,7 @@ import warnings
 import cvxpy as cp
 import torch
 
-from base import MPS, MPO, Broomstick, cached_einsum
+from base import DTYPE, MPS, MPO, Broomstick, cached_einsum
 from ext_register import extends_Broomstick
 
 
@@ -40,10 +40,8 @@ def _random_hermitian(dim: int,
                       device: torch.device,
                       generator: torch.Generator) -> torch.Tensor:
     '''Draw a random Hermitian dim x dim matrix.'''
-    t = torch.randn((dim, dim), dtype=torch.complex128,
-                    device=device, generator=generator)
-    t = t + 1j * torch.randn((dim, dim), dtype=torch.complex128,
-                             device=device, generator=generator)
+    t = torch.randn((dim, dim), dtype=DTYPE, device=device, generator=generator)
+    t = t + 1j * torch.randn((dim, dim), dtype=DTYPE, device=device, generator=generator)
     return 0.5 * (t + t.conj().T)
 
 

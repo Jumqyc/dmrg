@@ -1,17 +1,12 @@
-import os
-import sys
-
 import torch
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from torch import Tensor
 from dataclasses import dataclass
 
 from base import CUDA
-from FreeFermion.linalg import randcov, vacuum_covariance
+from FreeFermion.linalg import RandPureCov, vacuum_covariance
 
-from typing import Optional
+from typing import Optional,NewType
 
 '''
 Based on arxiv:2012.04666: C.-M. Jian, B. Bauer, A. Keselman and A. W. W. Ludwig,
@@ -27,13 +22,6 @@ covariance matrix ``Gamma_ij = < i/2 [gamma_i, gamma_j] >`` that are grouped int
 class Bond:
     '''
     Represents a bond between two nodes in the graph.
-
-    A bond is directed: its projector is prod_k (1 + i gamma_k upsilon_k)/2 with
-    gamma on the first and upsilon on the second end, so the order of the two nodes
-    is data of the bond and not a convenience.  Relabelling a node keeps the order,
-    which is what lets the contraction read the direction instead of keeping the
-    signs of a stored basis in step with the labels.
-
     Attributes:
         first (int): The node at the gamma end.
         second (int): The node at the upsilon end.
@@ -66,19 +54,16 @@ class Graph:
                  num_nodes: int,
                  edges: tuple[Bond, ...]):
         self.num_nodes = num_nodes
-        seen = {}
-        numbered = []
+        seen:dict[tuple[int, int], int] = {}
+        numbered:list[Bond] = []
         for bond in edges:
-            pair = tuple(sorted((bond.first, bond.second)))
-            index = seen.get(pair, 0)
-            seen[pair] = index + 1
+            pair:tuple[int, int] = (bond.first, bond.second) if bond.first < bond.second else (bond.second, bond.first)
+            index:int = seen.get(pair, 0)
+            seen[pair] = index + 1 
             numbered.append(Bond(bond.first, bond.second, bond.bond_dim, index))
         self.edges = tuple(numbered)
 
-        assert all(0 <= bond.first
-                   and bond.second < num_nodes 
-                   for bond in edges), \
-            "Bond nodes must be within the range of the number of nodes."
+        assert all(0 <= bond.first < num_nodes and 0 <= bond.second < num_nodes for bond in edges), "Bond nodes must be within the range of the number of nodes."
 
     def neighbors(self, node: int) -> list[int]:
         '''
@@ -86,6 +71,18 @@ class Graph:
         '''
         return sorted({bond.other(node) for bond in self.edges
                        if node in (bond.first, bond.second)})
+
+    def bonds(self, node: int) -> list[Bond]:
+        '''
+        the bonds that meet the given node, which are the legs of that node apart
+        from its external modes.
+        Args:
+            node: the node label.
+        Returns:
+            The bonds, in the order in which they appear in ``self.edges``.
+        '''
+        return [bond for bond in self.edges
+                if bond.first == node or bond.second == node]
 
 Leg = Optional[Bond]
 
@@ -101,7 +98,7 @@ class Node:
         '''
         the legs of this node.
         Returns:
-            The legs, the external modes first and then the bonds in order.
+            The legs, the external modes first and then the bonds in order. (first external, then the bonds in the order of the graph edges, so that relabelling a node never moves its modes)
         '''
         return sorted(self.sizes, key=lambda leg: (0, None) if leg is None else (1, leg))
 
@@ -127,7 +124,8 @@ class Node:
         Returns:
             The node holding the blocks.
         '''
-        offsets, position = {}, 0
+        offsets:dict[Leg, slice[int,int,int]] = {}
+        position = 0
         for leg in sizes:
             offsets[leg] = slice(position, position + sizes[leg])
             position += sizes[leg]
@@ -150,7 +148,8 @@ class Node:
             The real antisymmetric covariance, of size sum(sizes[leg] for leg in order).
         '''
         legs = self.legs() if order is None else order
-        offsets, position = {}, 0
+        offsets:dict[Leg, slice[int,int,int]] = {}
+        position = 0
         for leg in legs:
             offsets[leg] = slice(position, position + self.sizes[leg])
             position += self.sizes[leg]
@@ -165,8 +164,7 @@ class Node:
 
     def coupling(self, legs: list[Leg], bond: Bond) -> Tensor:
         '''
-        the blocks that couple a set of legs to one bond, stacked in the order of the
-        legs, which is the C of the contraction formula.
+        the blocks that couple a set of legs to one bond, stacked in the order of the legs, which is the C of the contraction formula.
         Args:
             legs: the legs to stack.
             bond: the bond they couple to.
@@ -177,10 +175,7 @@ class Node:
 
     def flipped(self, bonds: list[Bond]) -> 'Node':
         '''
-        this node with the sign of the basis of the given bonds flipped, which is
-        what turns the basis of the second end of a bond into the one of its first
-        end.  A block of two flipped bonds is quadratic in their modes, so only the
-        blocks that couple exactly one flipped bond to another leg change sign.
+        this node with the sign of the basis of the given bonds flipped, which is what turns the basis of the second end of a bond into the one of its first end.  A block of two flipped bonds is quadratic in their modes, so only the blocks that couple exactly one flipped bond to another leg change sign.
         Args:
             bonds: the bonds whose basis is flipped.
         Returns:
@@ -234,45 +229,43 @@ class Node:
             The glued node, keyed by the external leg (the modes of both nodes) and
             by the surviving bonds of both.
         '''
-        gamma = self.flipped(flip) if flip else self
-        upsilon = other
+        self = self.flipped(flip) if flip else self
         contracted = set(bonds)
-        open_i = [leg for leg in gamma.legs() if leg not in contracted]
-        open_j = [leg for leg in upsilon.legs() if leg not in contracted]
-        n_i = sum(gamma.sizes[leg] for leg in open_i)
-        n_open = n_i + sum(upsilon.sizes[leg] for leg in open_j)
-        chi = sum(gamma.sizes[bond] for bond in bonds)
+        open_i = [leg for leg in self.legs() if leg not in contracted]
+        open_j = [leg for leg in other.legs() if leg not in contracted]
+        n_i = sum(self.sizes[leg] for leg in open_i)
+        n_open = n_i + sum(other.sizes[leg] for leg in open_j)
+        chi = sum(self.sizes[bond] for bond in bonds)
 
-        block = gamma.assemble(bonds)
+        block = self.assemble(bonds)
         dtype, device = block.dtype, block.device
         eye = torch.eye(chi, dtype=dtype, device=device)
-        kernel = torch.cat([torch.cat([block, eye], dim=1),
-                            torch.cat([-eye, upsilon.assemble(bonds)], dim=1)], dim=0)
-        coupling = torch.zeros((n_open, 2 * chi), dtype=dtype, device=device)
-        coupling[:n_i, :chi] = torch.cat([gamma.coupling(open_i, bond) for bond in bonds],
-                                         dim=1)
+        k = torch.cat([torch.cat([block, eye], dim=1),
+                       torch.cat([-eye, other.assemble(bonds)], dim=1)], dim=0)
+        c = torch.zeros((n_open, 2 * chi), dtype=dtype, device=device)
+        c[:n_i, :chi] = torch.cat([self.coupling(open_i, bond) for bond in bonds],dim=1)
         # the coupling of the second end enters transposed in the reference formula,
         # and the antisymmetry of its blocks turns that into the same open x bond block
-        coupling[n_i:, chi:] = torch.cat([upsilon.coupling(open_j, bond) for bond in bonds],
+        c[n_i:, chi:] = torch.cat([other.coupling(open_j, bond) for bond in bonds],
                                          dim=1)
 
         psi = torch.zeros((n_open, n_open), dtype=dtype, device=device)
-        psi[:n_i, :n_i] = gamma.assemble(open_i)
-        psi[n_i:, n_i:] = upsilon.assemble(open_j)
+        psi[:n_i, :n_i] = self.assemble(open_i)
+        psi[n_i:, n_i:] = other.assemble(open_j)
         try:
-            solved = torch.linalg.solve(kernel, coupling.T)
+            solved = torch.linalg.solve(k, c.T)
         except torch.linalg.LinAlgError:
-            solved = torch.linalg.pinv(kernel) @ coupling.T
-        psi = psi + coupling @ solved
+            solved = torch.linalg.pinv(k) @ c.T
+        psi = psi + c @ solved
 
         # the merged node keeps the external modes of both nodes first and then the
         # surviving bonds; psi holds them as [gamma open | upsilon open], so the two
         # external blocks simply have to move next to each other
-        external = gamma.sizes[None] + upsilon.sizes[None]
-        order = list(range(gamma.sizes[None])) + list(range(n_i, n_i + upsilon.sizes[None])) \
-            + list(range(gamma.sizes[None], n_i)) + list(range(n_i + upsilon.sizes[None], n_open))
-        sizes = {None: external,
-                 **{leg: (gamma.sizes[leg] if leg in gamma.sizes else upsilon.sizes[leg])
+        external = self.sizes[None] + other.sizes[None]
+        order = list(range(self.sizes[None])) + list(range(n_i, n_i + other.sizes[None])) \
+            + list(range(self.sizes[None], n_i)) + list(range(n_i + other.sizes[None], n_open))
+        sizes:dict[Leg, int] = {None: external,
+                 **{leg: (self.sizes[leg] if leg in self.sizes else other.sizes[leg])
                     for leg in open_i + open_j if leg is not None}}
         return Node.from_dense(psi[order][:, order], sizes)
 
@@ -293,7 +286,7 @@ class GfPEPS:
         self.dtype = dtype
         self.device = device
         self._tensors = None
-        dense = [randcov(self.dim_of_node(node), dtype=dtype, device=device)
+        dense = [RandPureCov(self.dim_of_node(node), dtype=dtype, device=device)
                  for node in range(graph.num_nodes)]
         self._tensors = dense
         self.nodes = [Node.from_dense(dense[node], self.node_sizes(node))
@@ -307,7 +300,7 @@ class GfPEPS:
         Returns:
             The external leg first, then one leg per bond in the order of graph.edges.
         '''
-        return [None] + self.connected_nodes(node)
+        return [None] + self.graph.bonds(node)
 
     def node_sizes(self, node: int) -> dict[Leg, int]:
         '''
@@ -318,7 +311,7 @@ class GfPEPS:
             The sizes, keyed by leg.
         '''
         return {None: self.ext_dim[node],
-                **{bond: bond.bond_dim for bond in self.connected_nodes(node)}}
+                **{bond: bond.bond_dim for bond in self.graph.bonds(node)}}
 
     @classmethod
     def _from_data(cls,
@@ -420,8 +413,7 @@ class GfPEPS:
     def from_hamiltonian(cls, matrix: Tensor) -> 'GfPEPS':
         '''
         Ground state of the quadratic Hamiltonian H = (i/4) gamma^T M gamma
-        as a single node: Gamma = i sign(iM), the same convention as
-        CGO.GaussianCGO.ground_state_covariance.
+        as a single node: Gamma = i sign(iM).
         Args:
             matrix: the real antisymmetric Majorana matrix M, shape (2n, 2n).
         Returns:
@@ -474,19 +466,8 @@ class GfPEPS:
 
     def dim_of_node(self, node: int) -> int:
         return self.ext_dim[node] + sum(
-            bond.bond_dim for bond in self.connected_nodes(node)
+            bond.bond_dim for bond in self.graph.bonds(node)
         )
-
-    def connected_nodes(self, node: int) -> list[Bond]:
-        '''
-        Returns a list of Bonds that are directly connected to the given node, in
-        the order in which they appear in ``graph.edges``. The contractions keep
-        that order, so relabelling a node never moves its modes.
-        '''
-        return [
-            bond for bond in self.graph.edges 
-            if bond.first == node or bond.second == node
-        ]
 
     def contract_sites(self, i: int, j: int) -> 'GfPEPS':
         '''
@@ -550,10 +531,7 @@ class GfPEPS:
 
     def partial_trace(self, sites: list[int], from_end: bool = False) -> Tensor:
         '''
-        Exact reduced state of a set of nodes: contract every bond of the
-        network first, which keeps the state pure, and then trace out the rest,
-        which for a Gaussian state is the sub-block of the covariance on the kept
-        modes.
+        Exact reduced state of a set of nodes: contract every bond of the network first, which keeps the state pure, and then trace out the rest, which for a Gaussian state is the sub-block of the covariance on the kept modes.
         Args:
             sites: the original node labels whose external modes are kept.
             from_end: contract the bonds in the opposite order (same result).
@@ -588,24 +566,14 @@ class GfPEPO:
         self.dtype = dtype
         self.device = device
         self.tensors = [
-            randcov(self.dim_of_node(node), dtype=dtype, device=device)
+            RandPureCov(self.dim_of_node(node), dtype=dtype, device=device)
             for node in range(self.graph.num_nodes)
         ]
 
     def dim_of_node(self, node: int) -> int:
         return self.ext_dim_in[node] + self.ext_dim_out[node] + sum(
-            bond.bond_dim for bond in self.connected_nodes(node)
+            bond.bond_dim for bond in self.graph.bonds(node)
         )
-
-    def connected_nodes(self, node: int) -> list[Bond]:
-        '''
-        Returns a list of Bonds that are directly connected to the given node, in
-        the order in which they appear in ``graph.edges``.
-        '''
-        return [
-            bond for bond in self.graph.edges 
-            if bond.first == node or bond.second == node
-        ]
 
     @classmethod
     def _from_data(cls,
@@ -640,13 +608,7 @@ class GfPEPO:
 def _contract_all(network,
                   from_end: bool = False) -> tuple[Tensor, dict[int, list[int]]]:
     '''
-    Contract every bond of a state or operator network and return its covariance
-    matrix on the remaining external modes together with the positions of the
-    external modes of every original node. The external modes of the resulting
-    nodes are ordered as the bonds of the original network keep them, so the
-    modes of a node are contiguous and keep their original order. The bonds are
-    contracted from the front of the graph, or from the back with ``from_end``;
-    the result is the same covariance up to the mode order it reports.
+    Contract every bond of a state or operator network and return its covariance matrix on the remaining external modes together with the positions of the external modes of every original node. The external modes of the resulting nodes are ordered as the bonds of the original network keep them, so the modes of a node are contiguous and keep their original order. The bonds are contracted from the front of the graph, or from the back with ``from_end``; the result is the same covariance up to the mode order it reports.
     '''
     net = GfPEPS._from_data(network.graph, network.ext_dim, network.tensors)
     source = {node: [node] for node in range(network.graph.num_nodes)}

@@ -11,8 +11,6 @@ import sys
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
 from torch import Tensor
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
