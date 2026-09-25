@@ -35,7 +35,20 @@ def compute_score(x: Tensor, y: Tensor) -> Tensor:
     ...
 ```
 
+
 - In the comment describe the shape of the tensor, or other requirement (Hermitian, Unitary, anti-Hermitian, etc.).
+
+- Inside the function, use comment to explain hacking steps. (such as, bit-wise masking, strange steps for max performance) Although, do not use comment on easy steps. Python code should already clear enough
+
+- If type annotation is helpful in terms of understanding the structure of the code (such as, nested list, tuple, etc), then use annotation
+
+- When defining a tensor, write arguments once a line: such as
+```python
+t = torch.tensor(
+  data,
+  device = torch.device('cuda'),
+  dtype = torch.complex128)
+'''
 
 - Use latex format for equations. Use r-string if latex is included. 
 

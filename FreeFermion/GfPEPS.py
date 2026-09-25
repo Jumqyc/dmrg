@@ -4,7 +4,7 @@ from torch import Tensor
 from dataclasses import dataclass
 
 from base import CUDA
-from FreeFermion.linalg import RandPureCov, vacuum_covariance
+from FreeFermion.linalg import RandPureCov, symplectic_form
 
 from typing import Optional,NewType
 
@@ -458,8 +458,8 @@ class GfPEPS:
         tensors = []
         for node in range(graph.num_nodes):
             blocks = [site_covariance if site_covariance is not None
-                      else vacuum_covariance(ext_dim[node], dtype, device)]
-            blocks += [vacuum_covariance(bond.bond_dim, dtype, device)
+                      else symplectic_form(ext_dim[node], dtype, device)]
+            blocks += [symplectic_form(bond.bond_dim, dtype, device)
                        for bond in graph.edges if node in (bond.first, bond.second)]
             tensors.append(torch.block_diag(*blocks))
         return cls.from_covariances(graph, ext_dim, tensors)

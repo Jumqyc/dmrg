@@ -21,7 +21,8 @@ transform with the block values ``artanh(lambda_k)``, i.e.
 which is the primitive every other contraction of this module is built from, and
 ``majorana_gram`` gives the Gram matrix of the Majorana products
 ``gamma_S |Gamma>`` over the Majoranas of a covariance, which the caller picks by
-slicing the covariance down to them.
+slicing the covariance down to them.  ``hamiltonian`` is the map in the other
+direction: the quadratic Hamiltonian of a state, with every mode energy set to 1.
 """
 import math
 
@@ -34,15 +35,11 @@ from base import CUDA, DTYPE
 from FreeFermion.cuda.fermion import pfaffian
 
 
-def vacuum_covariance(num_modes: int,
+def symplectic_form(num_modes: int,
                       dtype: torch.dtype = torch.float64,
                       device: torch.device = CUDA) -> Tensor:
     '''
-    covariance of the vacuum of num_modes Majorana modes, i.e. of the state
-    whose normal modes are all empty and whose Williamson eigenvalues are all 1:
-    the adjacent Majorana pairs (gamma_2k, gamma_2k+1) are paired with J.  This is
-    the block diagonal form that RandPureCov conjugates and that the bond blocks of a
-    product state use.
+    The real antisymmetric symplectic form J of 2n Majoranas, with J @ J = -1.
     Args:
         num_modes: number of Majorana modes, even.
         dtype: dtype of the returned matrix.
@@ -68,8 +65,8 @@ def RandPureCov(dim: int,
     random pure Gaussian covariance of dim Majorana modes: an orthogonal q
     drawn from the Haar measure (the Q factor of a Gaussian matrix, with the signs
     of R fixed) conjugates the vacuum covariance J, whose 2x2 blocks [[0, -1],
-    [1, 0]] pair the adjacent Majoranas (gamma_2k, gamma_2k+1) exactly as D of
-    williamson_decomposition does.
+    [1, 0]] pair the adjacent Majoranas (gamma_2k, gamma_2k+1) exactly as the D of
+    williamson does.
     Args:
         dim: number of Majorana modes, even.
         dtype: dtype of the returned matrix.
@@ -86,24 +83,17 @@ def RandPureCov(dim: int,
     q,r = torch.linalg.qr(a)
     q = q @ torch.diag(torch.sign(torch.diagonal(r)))
 
-    return q @ vacuum_covariance(dim, dtype, device) @ q.T
+    return q @ symplectic_form(dim, dtype, device) @ q.T
 
 
-def williamson_decomposition(gamma: Tensor) -> tuple[Tensor, Tensor]:
-    '''
-    Williamson normal form of the covariance gamma, from the Hermitian
-    A = i gamma.  eigh returns the eigenvalues ascending in +-lambda_k pairs, so
-    the last n columns are the eigenvectors w_k of the positive lambda_k.  The
-    sqrt(2) in (sqrt(2) Re w_k, sqrt(2) Im w_k) is exactly the factor that makes
-    the two rows orthonormal, so R is real orthogonal and gamma = R^T D R.
-    The overall phase of every w_k is arbitrary; it cancels in D and in R^T D R.
+def williamson(gamma: Tensor) -> tuple[Tensor, Tensor]:
+    r'''
+    Williamson decomposition of the covariance gamma. 
     Args:
         gamma: real antisymmetric covariance, shape (2n, 2n).
     Returns:
         rotation: the real orthogonal matrix R, shape (2n, 2n).
-        blocks: the real block diagonal matrix D, shape (2n, 2n), block k equal to
-            lambda_k J, with the Williamson eigenvalues lambda_k = -D[2k, 2k + 1]
-            ascending in [0, 1], shape (n,).
+        lambdas: the Williamson eigenvalues, shape (n,), ascending in [0, 1].
     '''
     num_modes = gamma.shape[0] // 2
     eigenvalues, eigenvectors = torch.linalg.eigh(1j * gamma.to(DTYPE))
@@ -112,66 +102,45 @@ def williamson_decomposition(gamma: Tensor) -> tuple[Tensor, Tensor]:
     real = math.sqrt(2.0) * selected.real
     imag = math.sqrt(2.0) * selected.imag
     rotation = torch.empty((2 * num_modes, 2 * num_modes),
-                           dtype=real.dtype, device=real.device)
+                           dtype=real.dtype,
+                           device=real.device)
     rotation[0::2] = real.T
     rotation[1::2] = imag.T
-    blocks = torch.zeros((2 * num_modes, 2 * num_modes),
-                         dtype=lambdas.dtype, device=lambdas.device)
-    blocks[0::2, 1::2] = -torch.diag(lambdas)
-    blocks[1::2, 0::2] = torch.diag(lambdas)
-    return rotation, blocks
+    return rotation, lambdas
 
 
-def williamson_modes(gamma: Tensor,
-                     tolerance: float = 1e-10) -> tuple[Tensor, Tensor]:
-    '''
-    normal modes d_k of the Gaussian state with covariance gamma.  The row
-    pair (2k, 2k + 1) of R is (sqrt(2) Re w_k, sqrt(2) Im w_k), hence
-    d_k = (1/2) sum_mu (R[2k] + i R[2k + 1])_mu gamma_mu, normalised so that
-    {d_k, d_l^dag} = delta_kl and <d_k^dag d_l> = p_k delta_kl with
-    p_k = (1 - lambda_k) / 2.  The overall phase of each d_k is arbitrary and
-    drops out of the SDP.
+def hamiltonian(covariance: Tensor) -> Tensor:
+    r'''
+    Quadratic Hamiltonian H = (i/4) gamma^T M gamma of a Gaussian state with every mode
+    energy set to 1: the block diagonal D = diag(lambda_k J) of the Williamson
+    decomposition Gamma = R^T D R is replaced by the flat J = symplectic_form(2n), so
+
+        M = -R^T J R,
+
+    which inverts `GfPEPS.from_hamiltonian` for a pure covariance, where D = J already and
+    $M = -covariance$ exactly, and the state is the ground state of H.  A mixed covariance
+    is flattened instead, so the ground state of M is the canonical purification
+    $i\,\mathrm{sign}(i\,covariance)$ and not the state itself.
     Args:
-        gamma: real antisymmetric covariance, shape (2n, 2n).
-        tolerance: smallest lambda_k accepted as positive.
+        covariance: real antisymmetric covariance of the Gaussian state, shape
+            (2n, 2n), on CUDA.
     Returns:
-        occupations: the occupation p_k, shape (n,).
-        coeff: the complex coefficients of d_k over the 2n Majoranas, shape (n, 2n).
+        The real antisymmetric Majorana matrix M, shape (2n, 2n), with $iM$ having
+        eigenvalues $\pm 1$.
     Raises:
-        ValueError: if the number of positive eigenvalues of i gamma is not n.
+        ValueError: if the Williamson rotation is not orthogonal, which happens when a
+            mode is maximally mixed and the flat energies are not defined.
     '''
-    rotation, blocks = williamson_decomposition(gamma)
-    lambdas = -blocks[0::2, 1::2].diagonal()
-    positive = int((lambdas > tolerance).sum())
-    if positive != gamma.shape[0] // 2:
-        raise ValueError(f'expected {gamma.shape[0] // 2} positive eigenvalues, '
-                         f'got {positive}')
-    return (1.0 - lambdas) / 2.0, (rotation[0::2] + 1j * rotation[1::2]) / 2
-
-
-def williamson_modular(gamma: Tensor,
-                       clip: float = 1e-12) -> tuple[Tensor, Tensor]:
-    '''
-    modular matrix W = -2i artanh(i gamma) of the thermal form
-    rho = exp((i/4) gamma^T W gamma) / Z.  artanh is a matrix function, so it is
-    the same similarity transform as the decomposition with the block values
-    artanh(lambda_k): W = 2 R^T D' R.  Eigenvalues at the purity boundary are
-    clipped, which only fixes the decoupled fully empty or occupied modes.
-    Args:
-        gamma: real antisymmetric covariance, shape (2n, 2n).
-        clip: distance kept from |lambda_k| = 1 before artanh.
-    Returns:
-        modular: the real antisymmetric W, shape (2n, 2n).
-        lambdas: the unclipped Williamson eigenvalues, shape (n,), ascending in
-            [0, 1].
-    '''
-    rotation, blocks = williamson_decomposition(gamma)
-    lambdas = -blocks[0::2, 1::2].diagonal()
-    values = torch.atanh(lambdas.clamp(-1.0 + clip, 1.0 - clip))
-    scaled = torch.zeros_like(blocks)
-    scaled[0::2, 1::2] = -torch.diag(values)
-    scaled[1::2, 0::2] = torch.diag(values)
-    return 2.0 * rotation.T @ scaled @ rotation, lambdas
+    rotation, _ = williamson(covariance)
+    identity = torch.eye(covariance.shape[0],
+                         dtype=rotation.dtype,
+                         device=rotation.device)
+    if float((rotation.T @ rotation - identity).abs().max()) > 1e-9:
+        raise ValueError('the Williamson rotation is not orthogonal, so the covariance '
+                         'has a maximally mixed mode and the flat Hamiltonian is not defined')
+    return -rotation.T @ symplectic_form(covariance.shape[0],
+                             covariance.dtype,
+                             covariance.device) @ rotation
 
 
 
