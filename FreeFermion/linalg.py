@@ -82,6 +82,7 @@ def RandPureCov(dim: int,
     a = torch.randn(dim, dim, dtype=dtype, device=device)
     q,r = torch.linalg.qr(a)
     q = q @ torch.diag(torch.sign(torch.diagonal(r)))
+    # q samples from the Haar measure of O(dim), and q J q^T is a random pure covariance.
 
     return q @ symplectic_form(dim, dtype, device) @ q.T
 
