@@ -11,7 +11,8 @@ from opt_einsum import contract_expression
 
 # Default device and complex dtype of the library.
 CUDA = torch.device('cuda')
-DTYPE = torch.complex128
+COMPLEX = torch.complex128
+REAL = torch.float64
 
 # ---------------------------------------------------------------------------
 # Module-level cache for oe.contract_expression objects.
@@ -37,7 +38,7 @@ class SpinOperator:
     '''
     A tensor representing spin operators (Sx, Sy, Sz) for a given physical dimension.
     '''
-    def __init__(self, phys_dim:int, dtype:torch.dtype = DTYPE, device:torch.device = CUDA):
+    def __init__(self, phys_dim:int, dtype:torch.dtype = COMPLEX, device:torch.device = CUDA):
         self.data = torch.zeros((3, phys_dim, phys_dim),
                                  dtype=dtype,
                                  device=device,
@@ -78,7 +79,7 @@ class MPS:
                  phys_dim:int,
                  bond_dims:list[int]|None = None,
                  init_state:list[Tensor]|None = None,
-                 dtype:torch.dtype = DTYPE,
+                 dtype:torch.dtype = COMPLEX,
                  device:torch.device = CUDA):
         '''
         Args:
@@ -86,7 +87,7 @@ class MPS:
             phys_dim (int): Physical dimension of each site.
             bond_dims (list[int] | None): List of bond dimensions for each bond in the MPS. Including the left and right virtual bonds, the length of this list should be L+1. If None, defaults to [1] + [phys_dim] * (L - 1) + [1].
             init_state (list[Tensor] | None): Optional initial state for the MPS. If None, random tensors will be generated.
-            dtype (torch.dtype): Data type for the MPS tensors (default: DTYPE).
+            dtype (torch.dtype): Data type for the MPS tensors (default: COMPLEX).
             device (torch.device): Device to store the MPS tensors (default: 'cuda').
         Raises:
             ValueError: If the length of bond_dims does not match L+1.
@@ -363,7 +364,7 @@ class MPO:
                  L:int,
                  phys_dim:int,
                  mapping:dict[str,Tensor]|None = None,
-                 dtype:torch.dtype = DTYPE,
+                 dtype:torch.dtype = COMPLEX,
                  device:torch.device = CUDA):
         '''
         Args:

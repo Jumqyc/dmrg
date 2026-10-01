@@ -3,10 +3,10 @@ import torch
 from torch import Tensor
 from dataclasses import dataclass
 
-from base import CUDA
+from base import CUDA,REAL
 from FreeFermion.linalg import RandPureCov, symplectic_form
 
-from typing import Optional,NewType
+from typing import Optional
 
 '''
 Based on arxiv:2012.04666: C.-M. Jian, B. Bauer, A. Keselman and A. W. W. Ludwig,
@@ -273,7 +273,7 @@ class GfPEPS:
     def __init__(self, 
                  graph: Graph,
                  ext_dim: list[int],
-                 dtype: torch.dtype = torch.float64,
+                 dtype: torch.dtype = REAL,
                  device: torch.device = CUDA):
         '''
         graph: An instance of the Graph class representing the structure of the system.
@@ -438,7 +438,7 @@ class GfPEPS:
                       graph: Graph,
                       ext_dim: list[int],
                       site_covariance: Tensor | None = None,
-                      dtype: torch.dtype = torch.float64,
+                      dtype: torch.dtype = REAL,
                       device: torch.device = CUDA) -> 'GfPEPS':
         '''
         Network of uncorrelated nodes: every node covariance is block
@@ -551,7 +551,7 @@ class GfPEPO:
                  graph: Graph,
                  ext_dim_in: list[int],
                  ext_dim_out: list[int],
-                 dtype: torch.dtype = torch.float64,
+                 dtype: torch.dtype = REAL,
                  device: torch.device = CUDA):
         '''
         graph: An instance of the Graph class representing the structure of the system.

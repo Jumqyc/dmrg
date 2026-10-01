@@ -30,7 +30,7 @@ import torch
 
 from torch import Tensor
 
-from base import CUDA, DTYPE
+from base import CUDA, COMPLEX
 
 from FreeFermion.cuda.fermion import pfaffian
 
@@ -97,7 +97,7 @@ def williamson(gamma: Tensor) -> tuple[Tensor, Tensor]:
         lambdas: the Williamson eigenvalues, shape (n,), ascending in [0, 1].
     '''
     num_modes = gamma.shape[0] // 2
-    eigenvalues, eigenvectors = torch.linalg.eigh(1j * gamma.to(DTYPE))
+    eigenvalues, eigenvectors = torch.linalg.eigh(1j * gamma.to(COMPLEX))
     selected = eigenvectors[:, num_modes:]
     lambdas = eigenvalues[num_modes:].real
     real = math.sqrt(2.0) * selected.real
