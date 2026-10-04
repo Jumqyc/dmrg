@@ -1,10 +1,11 @@
 import math
 import warnings
 
-import cvxpy as cp
 import torch
 
 from base import COMPLEX, MPS, MPO, Broomstick, cached_einsum
+
+from sdp import extremal
 from ext_register import extends_Broomstick
 
 
@@ -240,86 +241,6 @@ def _mpo_commutator_matrix(state: MPS,
     return 1j * (one_sided('right') - one_sided('left'))
 
 
-def _build_cgo_dual(M_samples: list[torch.Tensor],
-                    B: torch.Tensor,
-                    constraint_tol: float = 0.0) -> cp.Problem:
-    '''
-    Build the dual CGO SDP for the upper bound on <B>.
-
-    M_samples[i] is the Hermitian projected commutator corresponding to
-    -i P_V [H_L, A_i] P_V in CGO's bra/ket convention, and B = P_V B P_V.  Both
-    must be expressed in an orthonormal basis of V_L.
-
-    The dual problem is
-
-        maximize   Tr(rho B)
-        subject to rho >= 0, Tr(rho) = 1,
-                   Tr(rho M_i) = 0 for all i
-
-    which is the tighter upper bound on <B>.  For the lower bound on <B>,
-    build the same problem with -B and negate the result.
-
-    `constraint_tol` >= 0 replaces the equalities by |Tr(rho M_i)| <=
-    constraint_tol.  The CGO constraints are exact only for an exact eigenstate
-    that lies exactly in the patch subspace; a converged DMRG state still leaves
-    the projected state violating them at a small but finite scale (the
-    discarded weight, or sqrt(var(H)) times the size of the commutators).  The
-    equalities are then numerically infeasible and the solvers fail or return a
-    bogus interval.  Relaxing by that scale keeps the bounds valid - the
-    projected state stays feasible and a larger feasible set can only widen the
-    interval - and is what :func:`CGO` does when `constraint_tol=None`.
-    '''
-    M = [m.detach().cpu().numpy() for m in M_samples]
-    M = [0.5 * (m + m.conj().T) for m in M]
-    B_np = B.detach().cpu().numpy()
-    B_np = 0.5 * (B_np + B_np.conj().T)
-
-    q = B_np.shape[0]
-    rho = cp.Variable((q, q), hermitian=True)
-    constraints = [rho >> 0, cp.trace(rho) == 1]
-    if constraint_tol > 0:
-        constraints += [cp.abs(cp.real(cp.trace(rho @ M[i]))) <= constraint_tol
-                        for i in range(len(M))]
-    else:
-        constraints += [cp.real(cp.trace(rho @ M[i])) == 0
-                        for i in range(len(M))]
-    return cp.Problem(cp.Maximize(cp.real(cp.trace(rho @ B_np))), constraints)
-
-
-def _solve_problem(problem: cp.Problem,
-                   solver: str,
-                   solver_kwargs: dict | None = None) -> float | None:
-    '''Solve one cvxpy problem and return its value, or None on failure.'''
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            problem.solve(solver=solver, verbose=False, **(solver_kwargs or {}))
-    except Exception:
-        return None
-
-    if problem.status not in ('optimal', 'optimal_inaccurate'):
-        return None
-    if problem.value is None:
-        return None
-
-    value = float(problem.value)
-    return value if math.isfinite(value) else None
-
-
-def _solve_bound(dual: cp.Problem,
-                 solver_configs: tuple[tuple[str, dict], ...]) -> float:
-    '''Solve one dual SDP, trying each solver configuration in order.'''
-    for solver, solver_kwargs in solver_configs:
-        value = _solve_problem(dual, solver, solver_kwargs)
-        if value is not None:
-            return value
-
-    raise RuntimeError(
-        'CGO SDP could not be solved with any of the configured solvers: '
-        f'{[name for name, _ in solver_configs]}.'
-    )
-
-
 def _solve_cgo_bounds(M_samples: list[torch.Tensor],
                       B: torch.Tensor,
                       constraint_tol: float = 0.0) -> tuple[float, float]:
@@ -332,19 +253,21 @@ def _solve_cgo_bounds(M_samples: list[torch.Tensor],
     it is first-order and wins for very small m (0.8 s vs 27 s at m = 4), but
     its iteration count grows quickly with m and with the accuracy target.
 
-    `constraint_tol` is forwarded to :func:`_build_cgo_dual`; see there for why
-    the exact equalities are usually infeasible in practice.
+    `constraint_tol` is forwarded to :func:`sdp.extremal`; see there for why the
+    exact equalities are usually infeasible in practice.
     '''
     solver_configs = (
         ('CLARABEL', {}),
         ('SCS', {'eps': 1e-9, 'max_iters': 200000}),
     )
 
-    upper = _solve_bound(_build_cgo_dual(M_samples, B, constraint_tol),
-                         solver_configs)
-    lower = -_solve_bound(_build_cgo_dual(M_samples, -B, constraint_tol),
-                          solver_configs)
-    return float(lower), float(upper)
+    bounds = extremal(B, M_samples, solver_configs, constraint_tol)
+    if bounds is None:
+        raise RuntimeError(
+            'CGO SDP could not be solved with any of the configured solvers: '
+            f'{[name for name, _ in solver_configs]}.'
+        )
+    return float(bounds[0]), float(bounds[1])
 
 
 def CGO_projections(self: Broomstick,

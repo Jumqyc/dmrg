@@ -1,233 +1,199 @@
+r'''
+Commutator gauge optimization on the patch of a Gaussian state.
 
-import itertools as it
+`GaussianCGO(covariance, internal)` takes the covariance of the whole state and the
+Majoranas that are traced out; the patch is the complement, `V_L = Im rho_L` is the
+support of its reduced state, and `basic_CGO` / `CGO` bound an observable on the patch.
+'''
+import itertools
 
-import cvxpy as cp
 import torch
 from torch import Tensor
 
-from FreeFermion.linalg import hamiltonian, wick
+from base import CUDA,COMPLEX,REAL
+from FreeFermion.linalg import hamiltonian, symplectic_form, wick, williamson
 
-
-def _merge(operator: list[tuple[complex, list[int]]]) -> list[tuple[complex, list[int]]]:
-    '''
-    Merge the terms of a Majorana string that carry the same labels, keeping the label order
-    of every term as given, so that only identical monomials are added.  `commutator` emits
-    one term per pair of input monomials and so repeats the same monomial many times, while
-    `project` spends one batched contraction per term, so merging is what keeps the projected
-    constraint cheap: the commutator of a dense H_L with a linear A_i is a linear operator of
-    2 * len(external) monomials, but 2 * len(H_L) terms before merging.
-    Args:
-        operator: a Majorana string, a sequence of (coefficient, labels) terms.
-    Returns:
-        One term per distinct label sequence, coefficients summed, sorted by labels, and the
-        terms that cancel to zero dropped.
-    '''
-    merged: dict[tuple[int, ...], complex] = {}
-    for coefficient, labels in operator:
-        key = tuple(labels)
-        merged[key] = merged.get(key, 0.0) + coefficient
-    return [(coefficient, list(labels))
-            for labels, coefficient in sorted(merged.items()) if coefficient != 0]
+from sdp import extremal
 
 
 class GaussianCGO:
     r'''
-    Basic CGO on a Gaussian state: the patch subspace of the internal bonds, and the projection of Majorana strings onto it.
-
-    The basis is the excitation family |S> = \gamma_S |Gamma> for every subset S of half of the Majoranas `internal`, which is where the products stop being over-complete: the  $2^{a/2}$ of them span $2^{a/2}$ directions as long as the state of that region carries full rank, which a generic (entangled) Gaussian state does, so the Gram is positive definite and Cholesky asserts it.  `project` gives the raw matrix in that basis,`project([])` is its identity case and therefore the Gram, and `compress` rotates a raw matrix into the orthonormal basis.  The subspace is built once, so every operator of the full CGO lands in the same basis.
+    CGO on the patch of a Gaussian state: the support of the patch block, the patch Hamiltonian, and the Majorana matrices the operators are expressed with.
     '''
+
+    @staticmethod
+    def majoranas(count: int,
+                   device: torch.device = CUDA) -> list[Tensor]:
+        r'''
+        Dense representation of Majorana operators. 
+        Args:
+            count: the number of Majoranas, even.
+            device: device of the matrices.
+        Returns:
+            The matrices, each of shape (2^m, 2^m), Hermitian, with square one and with
+            $\{\gamma_a,\gamma_b\} = 2\delta_{ab}$.
+        Raises:
+            ValueError: if `count` is odd.
+        '''
+        if count % 2:
+            raise ValueError(f'the number of Majoranas must be even, got {count}')
+        x = torch.tensor([[0, 1], [1, 0]], dtype=COMPLEX, device=device)
+        y = torch.tensor([[0, -1j], [1j, 0]], dtype=COMPLEX, device=device)
+        z = torch.tensor([[1, 0], [0, -1]], dtype=COMPLEX, device=device)
+        modes = count // 2
+        gammas = []
+        for k in range(modes):
+            prefix = torch.eye(1, dtype=COMPLEX, device=device)
+            for _ in range(k):
+                prefix = torch.kron(prefix, z)
+            suffix = torch.eye(2 ** (modes - 1 - k), dtype=COMPLEX, device=device)
+            gammas.append(torch.kron(torch.kron(prefix, x), suffix))
+            gammas.append(torch.kron(torch.kron(prefix, y), suffix))
+        return gammas
+
+
+    @staticmethod
+    def quadratic(gammas: list[Tensor],
+                   matrix: Tensor) -> Tensor:
+        r'''
+        The operator $H = (i/4)\gamma^T M \gamma = (i/2)\sum_{a<b}M_{ab}\gamma_a\gamma_b$ on
+        the Fock space.
+        Args:
+            gammas: the Majorana matrices of the modes the operator acts on.
+            matrix: real antisymmetric Majorana matrix, shape (2m, 2m), of those modes.
+        Returns:
+            The Hermitian matrix of shape (2**m, 2**m).
+        '''
+        size = gammas[0].shape[0]
+        operator = torch.zeros(size, size, dtype=COMPLEX, device=gammas[0].device)
+        for a in range(len(gammas)):
+            for b in range(a + 1, len(gammas)):
+                operator = operator + 0.5j * matrix[a, b] * (gammas[a] @ gammas[b])
+        return operator
+
+
+    @classmethod
+    def density(cls, gammas: list[Tensor],
+                 covariance: Tensor) -> Tensor:
+        r'''
+        Fock-space density matrix of the Gaussian state of a covariance: the modular
+        Hamiltonian is diagonal in the Williamson basis with the mode energies
+        $2\,\mathrm{artanh}(\lambda_k)$, capped so that a pure mode sits in its ground state,
+        and the state is $\rho \propto e^{-K}$.
+        Args:
+            gammas: the Majorana matrices of the modes of the covariance.
+            covariance: real antisymmetric covariance of those modes, shape (2m, 2m).
+        Returns:
+            The density matrix of shape (2**m, 2**m), Hermitian, positive definite and of
+            trace one, reproducing the covariance through
+            $\Gamma_{ab} = \mathrm{Tr}(\rho\,(i/2)[\gamma_a,\gamma_b])$.
+        '''
+        modes = len(gammas) // 2
+        pair = symplectic_form(2, dtype=covariance.dtype, device=covariance.device)
+        rotation, lambdas = williamson(covariance)
+        energies = -2.0 * torch.atanh(lambdas.clamp(max=1 - 1e-12)).clamp(max=20.0)
+        modular = rotation.T @ torch.block_diag(
+            *[energies[k] * pair for k in range(modes)]) @ rotation
+        rho = torch.linalg.matrix_exp(-cls.quadratic(gammas, modular))
+        return rho / rho.trace()
+
 
     def __init__(self,
                  covariance: Tensor,
-                 internal: list[int]) -> None:
+                 internal: list[int],
+                 tolerance: float = 1e-10,
+                 device: torch.device = CUDA) -> None:
         r'''
-        Build the patch subspace of the internal bonds: the Gram and the orthonormal basis in which every operator is expressed.
+        Build the patch data of one Gaussian state: the support of the reduced state on
+        the patch, and the Majorana matrices every operator is expressed with.
         Args:
             covariance: real antisymmetric covariance of the Gaussian state, shape
                 (2n, 2n), on CUDA.
-            internal: the Majorana labels of the internal bonds, an even number of them; the basis is generated by their first half, and the observable is expected on the complement.
+            internal: the Majorana labels that are traced out, a non-empty even list; the
+                patch is the complement, and every operator is expected on it.
+            tolerance: relative eigenvalue below which a direction lies outside the
+                support of the reduced state.
+            device: device of the Fock-space matrices.
         Raises:
-            ValueError: if `internal` is odd, so that its half is a whole number of Majoranas.
-            torch.linalg.LinAlgError: if the Gram is not positive definite, from
-                `torch.linalg.cholesky`.
+            ValueError: if `internal` is empty or odd, or if the reduced state has an
+                empty support, which needs every patch mode to be maximally mixed.
         '''
+        if not internal or len(internal) % 2:
+            raise ValueError(f'internal legs must be a non-empty even list of Majoranas, '
+                             f'got {len(internal)}')
         self.covariance = covariance
         self.internal = list(internal)
+        self.external = sorted(set(range(covariance.shape[0])) - set(internal))
+        self.gammas = self.majoranas(len(self.external), device)
+        self.fock_dim = self.gammas[0].shape[0]
+        self.position = {label: index for index, label in enumerate(self.external)}
 
-        if len(internal) % 2:
-            raise ValueError(f'Internal legs must carry an even number of Majoranas, but got {len(internal)}.')
+        self.rho = self.density(self.gammas, covariance[self.external][:, self.external])
+        values, vectors = torch.linalg.eigh(self.rho)
+        self.basis = vectors[:, values.real > tolerance * float(values.real.max())]
+        if not self.basis.shape[1]:
+            raise ValueError('the reduced state has an empty support: the patch carries no state')
+        self.size = int(self.basis.shape[1])
 
-        # the observable, the patch Hamiltonian and the constraints all live on the complement of the internal bonds, and ascending labels keep `commutator` valid
-        self.external: list[int] = sorted(set(range(covariance.shape[0])) - set(internal))
-
-        # half of the Majoranas of any patch is at most half of the covariance, which is where the products stop being over-complete, so this basis is independent for a generic state and Cholesky below doubles as the assertion of that
-        self.basis = self.internal[:len(self.internal) // 2]
-
-        self.labels = [
-            [self.basis[bit] for bit in range(len(self.basis)) if mask >> bit & 1]
-                for mask in range(2 ** len(self.basis))]
-        # example, basis = [0, 1, 4, 5]:
-        # labels[0] = []            (mask 0000)
-        # labels[3] = [0, 1]        (mask 0011)
-        # labels[12] = [4, 5]       (mask 1100)
-        self.size = len(self.labels)
-
-        # gamma_S^dag = (-1)^{|S|(|S|-1)/2} gamma_S, one sign per bra row
-        self.sign = torch.tensor(
-            [(-1) ** (bin(mask).count('1') * (bin(mask).count('1') - 1) // 2)
-             for mask in range(self.size)],
-            dtype=torch.float64,
-            device=covariance.device)
-
-        # the empty string is the identity, so its raw matrix is the Gram <S|T>
-        self.gram = self.project([])
-        assert (self.gram.conj().T - self.gram).abs().max() < 1e-12, 'Gram is not Hermitian'
-
-        # taking half leaves the Gram positive definite, so Cholesky both asserts that the
-        # family is independent and factorizes it, G = L L^dag, which leaves L^-dag as the
-        # orthonormal basis of the span
-        cholesky = torch.linalg.cholesky(self.gram)
-        identity = torch.eye(self.size,
-                             dtype=torch.complex128,
-                             device=covariance.device)
-        self.transform = torch.linalg.solve_triangular(cholesky.conj().T,
-                                                       identity,
-                                                       upper=True)
-
-    def project(self, operator: list[tuple[complex, list[int]]]) -> Tensor:
+    def operator(self, string: list[tuple[complex, list[int]]]) -> Tensor:
         r'''
-        Raw matrix of a Majorana string in the unnormalised excitation basis,
-
-            M[S, T] = (-1)^{|S|(|S|-1)/2} sum_A c_A <gamma_S gamma_A gamma_T>,
-
-        where the sign is the one of gamma_S^dag = (-1)^{|S|(|S|-1)/2} gamma_S and each expectation is a Pfaffian of the contraction kernel of the covariance.
+        The Fock-space matrix of a Majorana string on the patch,
+        $\sum_A c_A \prod_{a\in A}\gamma_a$.
         Args:
-            operator: the Majorana string, a sequence of (coefficient, labels) terms with
-                the labels of every monomial in ascending order; an empty sequence is the
-                identity, whose raw matrix is the Gram.
+            string: the Majorana string, a sequence of (coefficient, labels) terms, the
+                labels in `external` in ascending order.
         Returns:
-            M, Hermitian, shape (size, size).
+            The matrix of shape (fock, fock).
+        Raises:
+            ValueError: if a label does not belong to the patch.
         '''
-        matrix = torch.zeros(self.size,self.size,
-                             dtype=torch.complex128,
-                             device=self.covariance.device)
-        for coefficient, term in operator or [(1.0, [])]:
-            strings, places = [], []
-            for position, (bra, ket) in enumerate(it.product(range(self.size), repeat=2)):
-                string = self.labels[bra] + term + self.labels[ket]    # gamma_S gamma_A gamma_T
-                if len(string) % 2:
-                    continue                        # odd products vanish in the even state
-                strings.append(string)
-                places.append(position)
-            if not strings:
-                continue
-            # one batched wick for the term; the repeated Majoranas of the padding are self
-            # contractions of value one, so they leave every expectation unchanged
-            width = max(map(len, strings))
-            padded = torch.tensor(
-                [string + [0] * (width - len(string)) for string in strings],
-                dtype=torch.long,
-                device=self.covariance.device)
-                # padded to call wick in batch. 
-            block = torch.zeros(self.size * self.size,
-                                dtype=torch.complex128,
-                                device=self.covariance.device)
-            block[torch.tensor(places,
-                               dtype=torch.long,
-                               device=self.covariance.device)] = wick(self.covariance, padded)
-            matrix += coefficient * self.sign[:, None] * block.reshape(self.size, self.size)
+        matrix = torch.zeros(self.fock_dim, self.fock_dim, dtype=COMPLEX,
+                             device=self.gammas[0].device)
+        for coefficient, labels in string:
+            if any(label not in self.position for label in labels):
+                raise ValueError(f'every label of {labels} must belong to the patch '
+                                 f'{self.external}')
+            product = torch.eye(self.fock_dim, dtype=COMPLEX, device=self.gammas[0].device)
+            for label in labels:
+                product = product @ self.gammas[self.position[label]]
+            matrix = matrix + coefficient * product
         return matrix
-
-    def compress(self, matrix: Tensor) -> Tensor:
-        r'''
-        Rotate a raw matrix into the orthonormal basis of the excitation family: with  $G = L L^\dagger$ the basis is $L^{-\dagger}$, so the matrix is $L^{-1} M L^{-\dagger}$.
-        Args:
-            matrix: a raw matrix of `project`, shape (size, size).
-        Returns:
-            The same operator in the orthonormal basis of V_L, Hermitian, shape
-            (size, size).
-        '''
-        projected = self.transform.conj().T @ matrix @ self.transform
-        assert (projected.conj().T - projected).abs().max() < 1e-12, f'Projected matrix is not Hermitian, max abs difference = {(projected.conj().T - projected).abs().max()}'
-        return projected
-    
-    def by_wick(self, operator: list[tuple[complex, list[int]]]) -> float:
-        '''
-        <O> of the Gaussian state itself, by Wick's theorem.
-        Args:
-            operator: the Majorana string, a sequence of (coefficient, labels) terms.
-        Returns:
-            sum_A c_A <gamma_A>, real.
-        '''
-        return float(sum(coefficient * wick(self.covariance, term)
-                         for coefficient, term in operator).real)
-
-    def basic_CGO(self, operator: list[tuple[complex, list[int]]]) -> tuple[float, float]:
-        '''
-        Basic CGO bound, without the commutator constraints: the eigenvalue range of the projected operator bounds <O> for every state of V_L.
-        Args:
-            operator: the Majorana string, a sequence of (coefficient, labels) terms.
-        Returns:
-            (lower, upper): bounds on <O>.
-        '''
-        values = torch.linalg.eigvalsh(
-            self.compress(
-            self.project(operator)))
-        return float(values.min()), float(values.max())
 
     def patch_hamiltonian(self) -> list[tuple[complex, list[int]]]:
         r'''
-        Patch Hamiltonian H_L of the external Majoranas, as a Majorana string.  It is the flat Hamiltonian of the external slice of the covariance,
-
-            H_L = (i/4) gamma^T M gamma = (i/2) sum_{a < b} M_ab gamma_a gamma_b,
-
-        with M the `FreeFermion.linalg.hamiltonian` of `covariance[external][:, external]`, so one bilinear per pair of external Majoranas.
+        Patch Hamiltonian $H_L$ as a Majorana string: the flat Hamiltonian of the patch
+        block, $M = \texttt{FreeFermion.linalg.hamiltonian}(\Gamma_L)$ with
+        $\Gamma_L$ the block of the covariance on the patch.
         Returns:
-            The (coefficient, labels) terms of H_L, purely imaginary coefficients, one per pair of external Majoranas.
+            The (coefficient, labels) terms, purely imaginary, one per pair of patch
+            Majoranas.
         '''
-        block = self.covariance[self.external][:, self.external]
-        matrix = hamiltonian(block).cpu()      # one transfer, then plain complex coefficients
+        matrix = hamiltonian(self.covariance[self.external][:, self.external]).cpu()
         return [(0.5j * float(matrix[a, b]), [self.external[a], self.external[b]])
                 for a in range(len(self.external))
                 for b in range(a + 1, len(self.external))]
 
-    @staticmethod
-    def commutator(left: list[tuple[complex, list[int]]],
-                   right: list[tuple[complex, list[int]]]) -> list[tuple[complex, list[int]]]:
+    def enumerate_operators(self, degree: int) -> list[list[tuple[complex, list[int]]]]:
         r'''
-        Commutator of two Majorana strings, as a Majorana string.  Reducing a product to the monomial on the symmetric difference costs the sign of the crossings,
-
-            gamma_A gamma_B = (-1)^{N(A, B)} gamma_{A xor B},
-            N(A, B) = #{(a, b) in A x B : a > b},
-
-        and the two orders differ by N(A, B) against N(B, A), so
-
-            [gamma_A, gamma_B] = ((-1)^{N(A, B)} - (-1)^{N(B, A)}) gamma_{A xor B},
-
-        which vanishes when the two crossings have the same parity, in particular for  disjoint A and B with |A||B| even.  A bilinear of H_L and a linear A_i share a Majorana, so their commutator does not vanish.
+        Every monomial of `degree` Majoranas on the patch, made anti-Hermitian so that
+        its commutator with the quadratic $H_L$ is Hermitian.  A monomial has
+        $\gamma_A^\dagger = (-1)^{|A|(|A|-1)/2}\gamma_A$, so the factor $i$ is needed
+        exactly when that sign is $+1$.
         Args:
-            left: the first string, a sequence of (coefficient, labels) terms.
-            right: the second string, in the same form.
+            degree: the number of Majoranas in every monomial.
         Returns:
-            The (coefficient, labels) terms of the commutator, empty when it vanishes, one
-            per distinct monomial after `_merge`.
+            For every subset of the patch of that size, its (coefficient, labels).
         '''
-        terms = []
-        for left_coefficient, left_labels in left:
-            for right_coefficient, right_labels in right:
-                forward = sum(1 for a in left_labels for b in right_labels if a > b)
-                backward = sum(1 for a in right_labels for b in left_labels if a > b)
-                sign:int = (-1) ** forward - (-1) ** backward
-                if sign:
-                    terms.append((sign * left_coefficient * right_coefficient,
-                                  sorted(set(left_labels) ^ set(right_labels))))
-        return _merge(terms)
+        factor = 1j if (degree * (degree - 1) // 2) % 2 == 0 else 1.0
+        return [[(factor, list(labels))]
+                for labels in itertools.combinations(self.external, degree)]
 
     def sample_operators(self,
                          count: int,
                          seed: int | None = None) -> list[list[tuple[complex, list[int]]]]:
         r'''
-        Random anti-Hermitian Majorana strings on the external Majoranas: the A_i of the  CGO constraints.  Every string is a linear combination of the external Majoranas, A_i = i sum_a c_a gamma_a with real c_a, which is anti-Hermitian because the Majoranas are Hermitian.  Sharing a Majorana with a bilinear of H_L is what makes   [H_L, A_i] nonzero, so a linear string is the smallest useful one.
+        Random anti-Hermitian linear strings on the patch, $A_i = i\sum_a c_a\gamma_a$,
+        the smallest family whose commutator with $H_L$ does not vanish.
         Args:
             count: the number of strings to draw.
             seed: optional RNG seed.
@@ -237,29 +203,35 @@ class GaussianCGO:
         generator = torch.Generator(device=self.covariance.device)
         if seed is not None:
             generator.manual_seed(seed)
-        coefficients = torch.randn((count, len(self.external)),
-                                   dtype=torch.float64,
-                                   device=self.covariance.device,
-                                   generator=generator).cpu()
+        coefficients = torch.randn((count, len(self.external)), dtype=torch.float64,
+                                   device=self.covariance.device, generator=generator).cpu()
         return [[(1j * float(row[index]), [self.external[index]])
-                 for index in range(len(self.external))]
-                for row in coefficients]
+                 for index in range(len(self.external))] for row in coefficients]
 
-    def enumerate_operators(self, degree: int) -> list[list[tuple[complex, list[int]]]]:
+    def by_wick(self, operator: list[tuple[complex, list[int]]]) -> float:
         r'''
-        Every degree-Majorana monomial on the external Majoranas, made anti-Hermitian.  A
-        monomial has $\gamma_A^\dagger = (-1)^{|A|(|A|-1)/2}\gamma_A$, so the factor $i$ is
-        needed exactly when that sign is $+1$, and the commutator with the quadratic H_L is
-        then Hermitian, which is what `compress` asserts.  Unlike `sample_operators` this
-        family is deterministic, and its constraints span a fixed subspace of the Hermitian
-        matrices instead of a few random directions.
+        <O> of the Gaussian state, by Wick's theorem: every operator acts on the patch,
+        so its block of the covariance is all it needs.
         Args:
-            degree: the number of Majoranas in every monomial.
+            operator: the Majorana string, a sequence of (coefficient, labels) terms.
         Returns:
-            For every subset of the external Majoranas of that size, its (coefficient, labels).
+            sum_A c_A <gamma_A>, real.
         '''
-        factor = 1j if (degree * (degree - 1) // 2) % 2 == 0 else 1.0
-        return [[(factor, list(labels))] for labels in it.combinations(self.external, degree)]
+        return float(sum(coefficient * wick(self.covariance, term)
+                         for coefficient, term in operator).real)
+
+    def basic_CGO(self, operator: list[tuple[complex, list[int]]]) -> tuple[float, float]:
+        r'''
+        Basic CGO bound: the eigenvalue range of $P_VBP_V$ in $V_L$, which brackets the
+        expectation of the state because the state lies in $V_L$.
+        Args:
+            operator: the observable, a sequence of (coefficient, labels) terms.
+        Returns:
+            (lower, upper): bounds on <O>.
+        '''
+        projected = self.basis.conj().T @ self.operator(operator) @ self.basis
+        values = torch.linalg.eigvalsh(projected)
+        return float(values.min()), float(values.max())
 
     def CGO(self,
             operator: list[tuple[complex, list[int]]],
@@ -267,50 +239,48 @@ class GaussianCGO:
             degree: int = 2,
             solver: str = 'SCS',
             return_info: bool = False,
+            constraint_tol: float = 0.0,
             **options) -> tuple[float, float] | tuple[float, float, dict]:
         r'''
-        CGO bounds of a Majorana string: the basic interval is narrowed by the constraints
-        that the projected commutators vanish,
-
-            min/max Tr(sigma B)   s.t.  sigma >= 0,  Tr sigma = 1,  Tr(sigma M_i) = 0,
-
-        with $B$ = `compress(project(operator))` and $M_i$ =
-        `compress(project(commutator(H_L, A_i)))`.  Every $\langle[H_L,A_i]\rangle$ of the
-        state vanishes, so the exact expectation `by_wick` always lies in the interval, and
-        the family that bites is the one whose parity matches the observable: an even
-        observable against the even degrees (2, 4, ...), an odd one against the odd degrees.
+        CGO bounds of a Majorana string: min/max Tr(sigma B_L) over the states of $V_L$
+        with Tr(sigma [H_L, A_i]) = 0.
         Args:
             operator: the observable, a sequence of (coefficient, labels) terms.
-            operators: the A_i family; by default every monomial of `degree` Majoranas on the
-                external, which is what `enumerate_operators` returns.
+            operators: the A_i family; None enumerates every monomial of `degree` Majoranas.
             degree: the family to enumerate when `operators` is None.
-            solver: the cvxpy solver to use, SCS by default.
-            return_info: also return the solver status, the family size and the largest
-                constraint residual of the two solutions.
+            solver: the cvxpy solver, SCS by default.
+            return_info: also return the solver statuses, the family size, the dimension of
+                V_L and the exact expectation.
+            constraint_tol: bound on |Tr(sigma [H_L, A_i])|; 0.0 keeps the exact
+                equalities, which a state that only nearly satisfies them needs relaxed.
             **options: passed to `cvxpy.Problem.solve`.
         Returns:
             (lower, upper), or (lower, upper, info) when `return_info` is set.
+        Raises:
+            ValueError: if some [H_L, A_i] is not Hermitian, which happens when an A_i is
+                not anti-Hermitian and would make its constraint vacuous.
+            RuntimeError: if the solver reaches no optimal status.
         '''
         family = operators if operators is not None else self.enumerate_operators(degree)
-        terms = self.patch_hamiltonian()
-        rows = [self.compress(self.project(self.commutator(terms, A))).cpu().numpy() for A in family]
-        observable = self.compress(self.project(operator)).cpu().numpy()
-        sigma = cp.Variable((self.size, self.size), hermitian=True)
-        constraints = [sigma >> 0, cp.real(cp.trace(sigma)) == 1]
-        constraints += [cp.real(cp.trace(row @ sigma)) == 0 for row in rows]
-        bounds, statuses, residuals = [], [], []
-        for objective in (observable, -observable):
-            problem = cp.Problem(cp.Minimize(cp.real(cp.trace(objective @ sigma))), constraints)
-            problem.solve(solver=solver, **options)
-            bounds.append(float(problem.value if objective is observable else -problem.value))
-            statuses.append(problem.status)
-            # the residuals the solver leaves on the equalities, a diagnostic of the relaxation
-            solution = sigma.value
-            residuals.append(1e30 if solution is None else max(
-                [abs(float((row @ solution).trace().real)) for row in rows]
-                + [abs(float(solution.trace().real) - 1.0)]))
+        h_l = self.operator(self.patch_hamiltonian())
+        rows = []
+        for string in family:
+            a_i = self.operator(string)
+            row = self.basis.conj().T @ (h_l @ a_i - a_i @ h_l) @ self.basis
+            drift = float((row - row.conj().T).abs().max())
+            if drift > 1e-9:
+                raise ValueError(f'[H_L, A_i] is not Hermitian, max drift {drift:.1e}; '
+                                 f'every A_i has to be anti-Hermitian')
+            rows.append(row)
+        observable = self.basis.conj().T @ self.operator(operator) @ self.basis
+        solution = extremal(observable, rows, ((solver, options),), constraint_tol)
+        if solution is None:
+            raise RuntimeError(f'{solver} did not solve the CGO SDP, {len(family)} constraints')
+        lower, upper, statuses, residual = solution
         if return_info:
-            return bounds[0], bounds[1], {'status': statuses,
-                                          'constraints': len(family),
-                                          'residual': max(residuals)}
-        return bounds[0], bounds[1]
+            exact = self.by_wick(operator)
+            return lower, upper, {'status': statuses, 'constraints': len(family),
+                                  'dimension': self.size, 'residual': residual,
+                                  'exact': exact,
+                                  'inside': lower - 1e-7 <= exact <= upper + 1e-7}
+        return lower, upper
