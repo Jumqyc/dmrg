@@ -1,6 +1,6 @@
 import sys
 
-from base import Broomstick, MPS, MPO,SpinOperator
+from mpsdmrg import Broomstick, MPO, MPS, SpinOperator
 import numpy as np
 import torch
 

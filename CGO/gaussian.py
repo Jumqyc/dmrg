@@ -1,13 +1,14 @@
 r'''
 Commutator gauge optimization on the patch of a Gaussian state.
 '''
-import bisect
 import itertools
+
 import torch
 from torch import Tensor
 from base import COMPLEX, CUDA
 from FreeFermion.linalg import hamiltonian, wick, williamson
-from sdp import extremal
+from CGO.sdp import extremal
+from CGO.cuda.gaussian import apply_label
 
 type Term = tuple[complex, list[int]] # one (coefficient, labels) term of a Majorana string
 
@@ -51,9 +52,69 @@ class GaussianCGO:
         self.mixed = [k for k in range(self.modes) if k not in self.pure]
         self.size = 2 ** len(self.mixed)
 
+        # Per-mode geometry, fixed by the Williamson rotation: which modes are mixed,
+        # each one's bit in its register, and how many of each kind lie below it.
+        self.is_mixed = [False] * self.modes
+        self.mixed_below = [0] * self.modes       # mixed modes with index < k
+        self.pure_below = [0] * self.modes        # pure modes with index < k
+        self.mixed_mask = [0] * self.modes        # bit of mode k in the mixed register
+        self.pure_mask = [0] * self.modes         # bit of mode k in the pure register
+        mixed_position = pure_position = 0
+        for k in range(self.modes):
+            self.mixed_below[k] = mixed_position  # counts below k, since we walk k ascending
+            self.pure_below[k] = pure_position
+            if mixed_position < len(self.mixed) and self.mixed[mixed_position] == k:
+                self.is_mixed[k] = True
+                self.mixed_mask[k] = 1 << (len(self.mixed) - 1 - mixed_position)
+                mixed_position += 1
+            else:
+                self.pure_mask[k] = 1 << pure_position
+                pure_position += 1
+
+        # The kernel tables, shared by every patch label: one entry per normal
+        # mode, its even and its odd Majorana applied together.  Only the two
+        # coefficient columns depend on the label, so they alone are indexed per call.
+        self._below = torch.zeros(self.modes, dtype=torch.int32, device=device)
+        self._flip_mask = torch.zeros(self.modes, dtype=torch.int32, device=device)
+        self._subset_flip = torch.zeros(self.modes, dtype=torch.int32, device=device)
+        self._pure_lo = torch.zeros(self.modes, dtype=torch.int32, device=device)
+        self._pure_hi = torch.zeros(self.modes, dtype=torch.int32, device=device)
+        self._mixed = torch.zeros(self.modes, dtype=torch.int8, device=device)
+        for k in range(self.modes):
+            self._below[k] = ((1 << self.mixed_below[k]) - 1) << (len(self.mixed) - self.mixed_below[k])
+            self._pure_lo[k] = (1 << self.pure_below[k]) - 1
+            self._pure_hi[k] = self._pure_lo[k]
+            if self.is_mixed[k]:
+                self._mixed[k] = 1
+                self._flip_mask[k] = self.mixed_mask[k]
+            else:
+                self._subset_flip[k] = self.pure_mask[k]
+                self._pure_hi[k] |= self.pure_mask[k]
+        self._elem_even = self.rotation[0::2].T.to(dtype=COMPLEX, device=device).contiguous()
+        self._elem_odd = self.rotation[1::2].T.to(dtype=COMPLEX, device=device).contiguous()
+        self._pure_count = 2 ** len(self.pure)
+        # The pure vacuum is the same for every string: the identity on the mixed
+        # register with the pure register at 0, kept as one device buffer.
+        self._initial = torch.zeros((self._pure_count, self.size, self.size), 
+                                    dtype=COMPLEX, 
+                                    device=device)
+        self._initial[0] = torch.eye(self.size, 
+                                     dtype=COMPLEX, 
+                                     device=device)
+
     def project(self, *term: Term) -> Tensor:
         r'''
-        For the exact logic, see the notebook ``project_step.ipynb`` in the folder. 
+        Matrix of the Majorana string on V_L, the support of the reduced state.
+
+        V_L is spanned by the mixed modes (both occupations) with every pure mode
+        pinned to |0>, so a basis state splits into a mixed register (the
+        row/column index, big-endian) and a pure register.  The amplitudes are
+        carried as a batch over the pure register, of shape
+        (2**len(pure), size, size), and one label expands over the normal modes at
+        once: a normal-mode Majorana flips one occupation of either register and
+        multiplies by its Jordan-Wigner sign, and amplitudes that end outside the
+        pure vacuum are dropped, which is the projection onto V_L.  The expansion
+        runs in ``CGO/cuda/gaussian.cu``, so the batch stays on the device.
         Args:
             term: the terms of the Majorana string, each (coefficient, labels), the labels
                 in `internal_index` in ascending order.
@@ -62,50 +123,27 @@ class GaussianCGO:
         Raises:
             ValueError: if a label does not belong to the patch.
         '''
-        matrix = torch.zeros((self.size, self.size), dtype=COMPLEX, device=self.device)
-        identity = torch.eye(self.size, dtype=COMPLEX, device=self.device)
-        row = torch.arange(self.size, device=self.device)
-        plus = torch.ones(self.size, dtype=COMPLEX, device=self.device)
-        parity = plus.clone()
-        for bit in range(len(self.mixed)):
-            parity = torch.where(((row >> bit) & 1) == 0, parity, -parity)
+        matrix = torch.zeros((self.size, self.size), 
+                             dtype=COMPLEX, 
+                             device=self.device)
         for coefficient, labels in term:
             if any(label not in self.position for label in labels):
                 raise ValueError(f'every label of {labels} must belong to the patch '
                                  f'{self.internal_index}')
-            state = {0: identity}
+            amps = self._initial   # the pure vacuum, shared by every string
             for label in labels:
-                column = self.rotation[:, self.position[label]].tolist()
-                next_state: dict[int, Tensor] = {}
-                for mode, odd in itertools.product(range(self.modes), (False, True)):
-                    element = column[2 * mode + odd]
-                    if not element:
-                        continue
-                    mixed_count = bisect.bisect_left(self.mixed, mode)
-                    pure_count = bisect.bisect_left(self.pure, mode)
-                    below = ((1 << mixed_count) - 1) << (len(self.mixed) - mixed_count)
-                    sign = parity[row & below]
-                    pure_mask = (1 << pure_count) - 1
-                    if mode in self.mixed:
-                        mask = 1 << (len(self.mixed) - 1 - self.mixed.index(mode))
-                        flip, subset_flip = row ^ mask, 0
-                        if odd:
-                            sign = sign * torch.where((row & mask) == 0, 1j * plus,
-                                                      -1j * plus)
-                    else:
-                        flip, subset_flip = slice(None), 1 << self.pure.index(mode)
-                        if odd:
-                            sign = sign * 1j
-                            pure_mask |= subset_flip
-                    for subset, amplitude in state.items():
-                        weight = -sign if (subset & pure_mask).bit_count() % 2 else sign
-                        piece = element * (weight[:, None] * amplitude)[flip]
-                        target = subset ^ subset_flip
-                        previous = next_state.get(target)
-                        next_state[target] = piece if previous is None else previous + piece
-                state = next_state
-            if 0 in state:
-                matrix = matrix + coefficient * state[0]
+                # gamma_a = sum_b R_ba gamma_b: each normal mode adds its even and
+                # its odd Majorana to the expansion, applied to the whole batch.
+                amps = apply_label(amps, 
+                                   self._elem_even[self.position[label]], 
+                                   self._elem_odd[self.position[label]], 
+                                   self._below, 
+                                   self._flip_mask, 
+                                   self._subset_flip, 
+                                   self._pure_lo, 
+                                   self._pure_hi, 
+                                   self._mixed)
+            matrix = matrix + coefficient * amps[0]
         return matrix
 
     def sample_operators(self,

@@ -1,4 +1,4 @@
-from base import Broomstick
+from mpsdmrg import Broomstick
 
 # a decorator to extend Broomstick with a new method
 def extends_Broomstick(func):

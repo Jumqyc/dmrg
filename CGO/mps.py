@@ -3,10 +3,12 @@ import warnings
 
 import torch
 
-from base import COMPLEX, MPS, MPO, Broomstick, cached_einsum
+from base import COMPLEX
+from mpsdmrg import MPO, MPS, Broomstick
+from mpsdmrg.dmrg import cached_einsum
 
-from sdp import extremal
-from ext_register import extends_Broomstick
+from CGO.sdp import extremal
+from CGO.ext_register import extends_Broomstick
 
 
 # ---------------------------------------------------------------------------
