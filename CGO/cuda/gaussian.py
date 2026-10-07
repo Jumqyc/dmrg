@@ -4,14 +4,15 @@
 ``CGO/cuda/build``, so only the first import pays for the compilation.  The first
 build needs ninja (``python -m pip install ninja``); later imports load the
 cached ``CGO/cuda/build/gaussian_ext.so`` directly.
+
+The extension exposes one object, ``PatchProjector``, which derives and owns the
+register geometry of a patch; this module only loads it.
 """
 import importlib.util
 import os
 import sys
 
 import torch
-
-from torch import Tensor
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD_DIR = os.path.join(_HERE, 'build')
@@ -36,31 +37,6 @@ else:
                       verbose=False)
 
 
-def apply_label(amps: Tensor,
-                elem_even: Tensor,
-                elem_odd: Tensor,
-                below: Tensor,
-                flip_mask: Tensor,
-                subset_flip: Tensor,
-                pure_lo: Tensor,
-                pure_hi: Tensor,
-                mixed: Tensor) -> Tensor:
-    '''
-    Apply one Majorana label, expanded over the normal modes, to a whole batch of
-    patch states (CGO/cuda/gaussian.cu).
-    Args:
-        amps: the amplitude state, shape (pure_count, size, size), complex128 on CUDA.
-        elem_even: the even-Majorana rotation column of the label, shape (n_modes,),
-            complex128 on CUDA.
-        elem_odd: the odd-Majorana rotation column of the label, shape (n_modes,).
-        below: mixed-register mask of the modes below each mode, int32.
-        flip_mask: mixed-register bit each mode flips, int32, 0 for a pure mode.
-        subset_flip: pure-register bit each mode flips, int32, 0 for a mixed mode.
-        pure_lo: pure-register mask below each mode, int32.
-        pure_hi: `pure_lo` plus the mode's own pure bit, int32.
-        mixed: 1 for a mixed mode, int8.
-    Returns:
-        The state after the label, shape (pure_count, size, size).
-    '''
-    return _extension.apply_label(amps, elem_even, elem_odd, below, flip_mask,
-                                  subset_flip, pure_lo, pure_hi, mixed)
+# The extension class, built from (rotation, is_mixed); its constructor, `vacuum`
+# and `apply` are documented in CGO/cuda/gaussian.cu.
+PatchProjector = _extension.PatchProjector

@@ -8,7 +8,7 @@ from torch import Tensor
 from base import COMPLEX, CUDA
 from FreeFermion.linalg import hamiltonian, wick, williamson
 from CGO.sdp import extremal
-from CGO.cuda.gaussian import apply_label
+from CGO.cuda.gaussian import PatchProjector
 
 type Term = tuple[complex, list[int]] # one (coefficient, labels) term of a Majorana string
 
@@ -47,77 +47,27 @@ class GaussianCGO:
         self.device = device
 
         self.internal_block = covariance[self.internal_index][:, self.internal_index]
-        self.rotation, occ = williamson(self.internal_block)
-        self.pure = [k for k in range(self.modes) if float(occ[k]) > 1.0 - tolerance]
+        self.rotation, self.occupations = williamson(self.internal_block)
+        self.pure = [k for k in range(self.modes) if float(self.occupations[k]) > 1.0 - tolerance]
         self.mixed = [k for k in range(self.modes) if k not in self.pure]
         self.size = 2 ** len(self.mixed)
 
-        # Per-mode geometry, fixed by the Williamson rotation: which modes are mixed,
-        # each one's bit in its register, and how many of each kind lie below it.
-        self.is_mixed = [False] * self.modes
-        self.mixed_below = [0] * self.modes       # mixed modes with index < k
-        self.pure_below = [0] * self.modes        # pure modes with index < k
-        self.mixed_mask = [0] * self.modes        # bit of mode k in the mixed register
-        self.pure_mask = [0] * self.modes         # bit of mode k in the pure register
-        mixed_position = pure_position = 0
-        for k in range(self.modes):
-            self.mixed_below[k] = mixed_position  # counts below k, since we walk k ascending
-            self.pure_below[k] = pure_position
-            if mixed_position < len(self.mixed) and self.mixed[mixed_position] == k:
-                self.is_mixed[k] = True
-                self.mixed_mask[k] = 1 << (len(self.mixed) - 1 - mixed_position)
-                mixed_position += 1
-            else:
-                self.pure_mask[k] = 1 << pure_position
-                pure_position += 1
-
-        # The kernel tables, shared by every patch label: one entry per normal
-        # mode, its even and its odd Majorana applied together.  Only the two
-        # coefficient columns depend on the label, so they alone are indexed per call.
-        self._below = torch.zeros(self.modes, dtype=torch.int32, device=device)
-        self._flip_mask = torch.zeros(self.modes, dtype=torch.int32, device=device)
-        self._subset_flip = torch.zeros(self.modes, dtype=torch.int32, device=device)
-        self._pure_lo = torch.zeros(self.modes, dtype=torch.int32, device=device)
-        self._pure_hi = torch.zeros(self.modes, dtype=torch.int32, device=device)
-        self._mixed = torch.zeros(self.modes, dtype=torch.int8, device=device)
-        for k in range(self.modes):
-            self._below[k] = ((1 << self.mixed_below[k]) - 1) << (len(self.mixed) - self.mixed_below[k])
-            self._pure_lo[k] = (1 << self.pure_below[k]) - 1
-            self._pure_hi[k] = self._pure_lo[k]
-            if self.is_mixed[k]:
-                self._mixed[k] = 1
-                self._flip_mask[k] = self.mixed_mask[k]
-            else:
-                self._subset_flip[k] = self.pure_mask[k]
-                self._pure_hi[k] |= self.pure_mask[k]
-        self._elem_even = self.rotation[0::2].T.to(dtype=COMPLEX, device=device).contiguous()
-        self._elem_odd = self.rotation[1::2].T.to(dtype=COMPLEX, device=device).contiguous()
-        self._pure_count = 2 ** len(self.pure)
-        # The pure vacuum is the same for every string: the identity on the mixed
-        # register with the pure register at 0, kept as one device buffer.
-        self._initial = torch.zeros((self._pure_count, self.size, self.size), 
-                                    dtype=COMPLEX, 
-                                    device=device)
-        self._initial[0] = torch.eye(self.size, 
-                                     dtype=COMPLEX, 
-                                     device=device)
+        # The register geometry the kernel is written against -- the mode masks, the
+        # Jordan-Wigner signs and the coefficient columns -- is derived and owned by
+        # the extension; the classification of the modes is its only input.
+        self._projector = PatchProjector(
+            self.rotation,
+            torch.tensor([1 if k in self.mixed else 0 for k in range(self.modes)],
+                         dtype=torch.int8, 
+                         device=device))
 
     def project(self, *term: Term) -> Tensor:
         r'''
         Matrix of the Majorana string on V_L, the support of the reduced state.
 
-        V_L is spanned by the mixed modes (both occupations) with every pure mode
-        pinned to |0>, so a basis state splits into a mixed register (the
-        row/column index, big-endian) and a pure register.  The amplitudes are
-        carried as a batch over the pure register, of shape
-        (2**len(pure), size, size), and one label expands over the normal modes at
-        once: a normal-mode Majorana flips one occupation of either register and
-        multiplies by its Jordan-Wigner sign, and amplitudes that end outside the
-        pure vacuum are dropped, which is the projection onto V_L.  The expansion
-        runs in ``CGO/cuda/gaussian.cu``, so the batch stays on the device.
+        V_L is spanned by the mixed modes (both occupations) with every pure mode pinned to |0>, so a basis state splits into a mixed register (the row/column index, big-endian) and a pure register.  The amplitudes are carried as a batch over the pure register, of shape (2**len(pure), size, size), and one label expands over the normal modes at once: a normal-mode Majorana flips one occupation of either register and multiplies by its Jordan-Wigner sign, and amplitudes that end outside the pure vacuum are dropped, which is the projection onto V_L.  The expansion runs in ``CGO/cuda/gaussian.cu``, so the batch stays on the device.
         Args:
-            term: the terms of the Majorana string, each (coefficient, labels), the labels
-                in `internal_index` in ascending order.
+            term: the terms of the Majorana string, each (coefficient, labels), the labels in `internal_index` in ascending order.
         Returns:
             The matrix of shape (size, size).
         Raises:
@@ -130,19 +80,15 @@ class GaussianCGO:
             if any(label not in self.position for label in labels):
                 raise ValueError(f'every label of {labels} must belong to the patch '
                                  f'{self.internal_index}')
-            amps = self._initial   # the pure vacuum, shared by every string
-            for label in labels:
-                # gamma_a = sum_b R_ba gamma_b: each normal mode adds its even and
-                # its odd Majorana to the expansion, applied to the whole batch.
-                amps = apply_label(amps, 
-                                   self._elem_even[self.position[label]], 
-                                   self._elem_odd[self.position[label]], 
-                                   self._below, 
-                                   self._flip_mask, 
-                                   self._subset_flip, 
-                                   self._pure_lo, 
-                                   self._pure_hi, 
-                                   self._mixed)
+            amps = self._projector.vacuum()   # the pure vacuum, shared by every string
+            # The kernel left-multiplies, so walking the labels backwards is what
+            # makes the product come out in the order they are written in; walking
+            # them forwards would reverse the string, which flips the sign of every
+            # monomial with d(d-1)/2 odd (d = 2, 3 mod 4).
+            for label in reversed(labels):
+                # gamma_a = sum_b R_ba gamma_b: the kernel expands the label over the
+                # normal modes and applies the whole expansion to the batch.
+                amps = self._projector.apply(amps, self.position[label])
             matrix = matrix + coefficient * amps[0]
         return matrix
 
@@ -150,8 +96,7 @@ class GaussianCGO:
                          count: int,
                          seed: int | None = None) -> list[list[Term]]:
         r'''
-        Random anti-Hermitian linear strings on the patch, A_i = i sum_a c_a gamma_a,
-        the smallest family whose commutator with H_L does not vanish.
+        Random anti-Hermitian linear strings on the patch, A_i = i sum_a c_a gamma_a, the smallest family whose commutator with H_L does not vanish.
         Args:
             count: the number of strings to draw.
             seed: optional RNG seed.
@@ -161,15 +106,16 @@ class GaussianCGO:
         generator = torch.Generator(device=self.device)
         if seed is not None:
             generator.manual_seed(seed)
-        coefficients = torch.randn((count, len(self.internal_index)), dtype=torch.float64,
-                                   device=self.device, generator=generator).cpu()
+        coefficients = torch.randn((count, len(self.internal_index)), 
+                                   dtype=torch.float64,
+                                   device=self.device, 
+                                   generator=generator).cpu()
         return [[(1j * float(row[index]), [self.internal_index[index]])
                  for index in range(len(self.internal_index))] for row in coefficients]
 
     def by_wick(self, *term: Term) -> float:
-        r'''
-        <O> of the Gaussian state, by Wick's theorem: every operator acts on the patch,
-        so its block of the covariance is all it needs.
+        '''
+        avg(O) of the Gaussian state, by Wick's theorem: every operator acts on the patch, so its block of the covariance is all it needs.
         Args:
             term: the terms of the Majorana string.
         Returns:
@@ -196,6 +142,7 @@ class GaussianCGO:
             solver: str = 'SCS',
             return_info: bool = False,
             constraint_tol: float = 0.0,
+            energies: Tensor | None = None,
             **options) -> tuple[float, float] | tuple[float, float, dict]:
         r'''
         CGO bounds of a Majorana string: min/max Tr(sigma B_L) over the states of V_L
@@ -209,6 +156,8 @@ class GaussianCGO:
                 V_L and the exact expectation.
             constraint_tol: bound on |Tr(sigma [H_L, A_i])|; 0.0 keeps the exact
                 equalities, which a state that only nearly satisfies them needs relaxed.
+            energies: energy of each normal mode of the state, shape (n,) for a
+                covariance of shape (2n, 2n); None gives every mode the energy 1.
             **options: passed to cvxpy.Problem.solve.
         Returns:
             (lower, upper), or (lower, upper, info) when `return_info` is set.
@@ -225,20 +174,20 @@ class GaussianCGO:
                       for labels in itertools.combinations(self.internal_index, degree)]
         else:
             family = operators
-        # H_L, the flat Hamiltonian of the patch block, as a Majorana string
-        flat = hamiltonian(self.internal_block).cpu()
+
+        # H_L: the parent Hamiltonian of the whole state, keeping the terms whose support lies inside the patch
+        full = hamiltonian(self.covariance, energies).cpu()
+        labels = self.internal_index
         h_l = self.project(*[
-            (0.5j * float(flat[a, b]), [self.internal_index[a], self.internal_index[b]])
-            for a in range(len(self.internal_index))
-            for b in range(a + 1, len(self.internal_index))])
+            (0.5j * float(full[labels[a], labels[b]]), [labels[a], labels[b]])
+            for a in range(len(labels))
+            for b in range(a + 1, len(labels))])
         rows = []
         for string in family:
             a_i = self.project(*string)
             row = h_l @ a_i - a_i @ h_l
             drift = float((row - row.conj().T).abs().max())
-            if drift > 1e-9:
-                raise ValueError(f'[H_L, A_i] is not Hermitian, max drift {drift:.1e}; '
-                                 f'every A_i has to be anti-Hermitian')
+            assert drift < 1e-9, ValueError(f'[H_L, A_i] is not Hermitian, max drift {drift:.1e}; every A_i has to be anti-Hermitian')
             rows.append(row)
         observable = self.project(*term)
         solution = extremal(observable, rows, ((solver, options),), constraint_tol)

@@ -255,12 +255,16 @@ def _solve_cgo_bounds(M_samples: list[torch.Tensor],
     it is first-order and wins for very small m (0.8 s vs 27 s at m = 4), but
     its iteration count grows quickly with m and with the accuracy target.
 
+    SCS runs at eps = 1e-5: on a physical patch of dimension 128 the same program
+    at eps = 1e-9 does not converge in 900 s, while 1e-5 takes 15 s and moves the
+    bounds by 3e-6, far below the width of the interval being computed.
+
     `constraint_tol` is forwarded to :func:`sdp.extremal`; see there for why the
     exact equalities are usually infeasible in practice.
     '''
     solver_configs = (
         ('CLARABEL', {}),
-        ('SCS', {'eps': 1e-9, 'max_iters': 200000}),
+        ('SCS', {'eps': 1e-5, 'max_iters': 200000}),
     )
 
     bounds = extremal(B, M_samples, solver_configs, constraint_tol)

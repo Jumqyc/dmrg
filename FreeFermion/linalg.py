@@ -110,38 +110,50 @@ def williamson(gamma: Tensor) -> tuple[Tensor, Tensor]:
     return rotation, lambdas
 
 
-def hamiltonian(covariance: Tensor) -> Tensor:
+def hamiltonian(covariance: Tensor, spec: Tensor | None = None) -> Tensor:
     r'''
-    Quadratic Hamiltonian H = (i/4) gamma^T M gamma of a Gaussian state with every mode
-    energy set to 1: the block diagonal D = diag(lambda_k J) of the Williamson
-    decomposition Gamma = R^T D R is replaced by the flat J = symplectic_form(2n), so
+    Quadratic Hamiltonian H = (i/4) gamma^T M gamma of a Gaussian state, with one mode
+    energy per normal mode: the block diagonal D = diag(lambda_k J) of the Williamson
+    decomposition Gamma = R^T D R is replaced by diag(spec_k J), so
 
-        M = -R^T J R,
+        M = -R^T diag(spec_k J) R,
 
-    which inverts `GfPEPS.from_hamiltonian` for a pure covariance, where D = J already and
-    $M = -covariance$ exactly, and the state is the ground state of H.  A mixed covariance
-    is flattened instead, so the ground state of M is the canonical purification
-    $i\,\mathrm{sign}(i\,covariance)$ and not the state itself.
+    which inverts `GfPEPS.from_hamiltonian` for a pure covariance at the flat spec, where
+    D = J already and $M = -covariance$ exactly, and the state is the ground state of H.
+    A mixed covariance is flattened instead, so the ground state of M is the canonical
+    purification $i\,\mathrm{sign}(i\,covariance)$ and not the state itself.  The ground
+    state fixes only the sign of each energy, so every positive `spec` gives the same
+    state and the magnitudes are free parameters of the Hamiltonian rather than of the
+    state.
     Args:
         covariance: real antisymmetric covariance of the Gaussian state, shape
             (2n, 2n), on CUDA.
+        spec: energy of each normal mode, shape (n,); None sets every energy to 1.
     Returns:
         The real antisymmetric Majorana matrix M, shape (2n, 2n), with $iM$ having
-        eigenvalues $\pm 1$.
+        eigenvalues $\pm\mathrm{spec}_k$.
     Raises:
         ValueError: if the Williamson rotation is not orthogonal, which happens when a
-            mode is maximally mixed and the flat energies are not defined.
+            mode is maximally mixed and the mode energies are not defined; or if `spec`
+            does not hold one energy per mode.
     '''
     rotation, _ = williamson(covariance)
     identity = torch.eye(covariance.shape[0],
                          dtype=rotation.dtype,
                          device=rotation.device)
-    if float((rotation.T @ rotation - identity).abs().max()) > 1e-9:
-        raise ValueError('the Williamson rotation is not orthogonal, so the covariance '
-                         'has a maximally mixed mode and the flat Hamiltonian is not defined')
-    return -rotation.T @ symplectic_form(covariance.shape[0],
+    assert float((rotation.T @ rotation - identity).abs().max()) < 1e-9, ValueError('the Williamson rotation is not orthogonal, so the covariance has a maximally mixed mode and the mode energies are not defined')
+    if spec is None:
+        return -rotation.T @ symplectic_form(covariance.shape[0],
                              covariance.dtype,
                              covariance.device) @ rotation
+    modes = covariance.shape[0] // 2
+    if spec.shape != (modes,):
+        raise ValueError(f'spec holds one energy per mode, so shape ({modes},), '
+                         f'got {tuple(spec.shape)}')
+    form = symplectic_form(covariance.shape[0], covariance.dtype, covariance.device)
+    form[0::2, 1::2] = -torch.diag(spec)
+    form[1::2, 0::2] = torch.diag(spec)
+    return -rotation.T @ form @ rotation
 
 
 

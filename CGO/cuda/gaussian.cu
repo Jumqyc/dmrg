@@ -1,13 +1,18 @@
-// CUDA implementation of the patch projection of ``CGO.gaussian.GaussianCGO``: one
-// Majorana label of a string is expanded over the n normal modes of the patch,
-// and every mode (its even and its odd Majorana together) is applied to the
-// whole batched amplitude state at once.
+// CUDA implementation of the patch projection of ``CGO.gaussian.GaussianCGO``.
 //
-// The state is a tensor (pure_count, size, size): axis 0 is the pure register
-// (the pure modes, pinned to their ground state), the two matrix axes are the
-// mixed register.  Each mode maps an output element back to a single source
-// element, so the kernel gathers and accumulates with no atomics and no host
-// round trip, and the even and the odd Majorana of a mode share one read.
+// ``PatchProjector`` owns everything the kernel needs and nothing the algorithm
+// needs: from the Williamson rotation of the patch block and the classification
+// of its modes into pure and mixed, it derives the register masks, the
+// Jordan-Wigner signs and the coefficient columns, and it hands out the vacuum
+// amplitude state.  The Python side only sees this object, so the bookkeeping of
+// the registers never leaves the extension.
+//
+// The amplitude state is a tensor (pure_count, size, size): axis 0 is the pure
+// register (the pure modes, pinned to their ground state), the two matrix axes
+// are the mixed register.  Applying one Majorana label expands it over the n
+// normal modes of the patch; each mode maps an output element back to a single
+// source element, so the kernel gathers and accumulates with no atomics, and the
+// even and the odd Majorana of a mode share one read.
 //
 // Build and load through CGO/cuda/gaussian.py (torch.utils.cpp_extension.load).
 #include <torch/extension.h>
@@ -16,6 +21,7 @@
 #include <cuComplex.h>
 #include <cstdint>
 #include <algorithm>
+#include <vector>
 
 namespace {
 
@@ -39,6 +45,7 @@ __global__ void apply_label_kernel(
         cuDoubleComplex* __restrict__ out,
         const cuDoubleComplex* __restrict__ elem_even,
         const cuDoubleComplex* __restrict__ elem_odd,
+        const int64_t coefficient_offset,
         const int32_t* __restrict__ below,
         const int32_t* __restrict__ flip_mask,
         const int32_t* __restrict__ subset_flip,
@@ -62,8 +69,8 @@ __global__ void apply_label_kernel(
         const int64_t column = rem & (size - 1);
         cuDoubleComplex acc = make_cuDoubleComplex(0.0, 0.0);
         for (int64_t k = 0; k < num_modes; ++k) {
-            const cuDoubleComplex ee = elem_even[k];
-            const cuDoubleComplex eo = elem_odd[k];
+            const cuDoubleComplex ee = elem_even[coefficient_offset + k];
+            const cuDoubleComplex eo = elem_odd[coefficient_offset + k];
             const bool has_even = !(ee.x == 0.0 && ee.y == 0.0);
             const bool has_odd = !(eo.x == 0.0 && eo.y == 0.0);
             if (!has_even && !has_odd) {
@@ -93,67 +100,133 @@ __global__ void apply_label_kernel(
     }
 }
 
-torch::Tensor apply_label(torch::Tensor amps,
-                          torch::Tensor elem_even,
-                          torch::Tensor elem_odd,
-                          torch::Tensor below,
-                          torch::Tensor flip_mask,
-                          torch::Tensor subset_flip,
-                          torch::Tensor pure_lo,
-                          torch::Tensor pure_hi,
-                          torch::Tensor mixed) {
-    TORCH_CHECK(amps.is_cuda(), "amps has to be a CUDA tensor");
-    TORCH_CHECK(amps.scalar_type() == at::kComplexDouble, "amps has to be complex128");
-    TORCH_CHECK(amps.dim() == 3, "amps has to be (pure_count, size, size)");
-    TORCH_CHECK(amps.is_contiguous(), "amps has to be contiguous");
-    for (const auto* elem : {&elem_even, &elem_odd}) {
-        TORCH_CHECK(elem->is_cuda() && elem->scalar_type() == at::kComplexDouble
-                    && elem->is_contiguous(),
-                    "the coefficient tables have to be contiguous complex128 CUDA tensors");
-    }
-    TORCH_CHECK(elem_even.numel() == elem_odd.numel(),
-                "the even and odd coefficient tables have to have the same length");
-    const int64_t num_modes = elem_even.numel();
-    for (const auto* index_tensor : {&below, &flip_mask, &subset_flip, &pure_lo, &pure_hi}) {
-        TORCH_CHECK(index_tensor->is_cuda() && index_tensor->scalar_type() == at::kInt
-                    && index_tensor->is_contiguous() && index_tensor->numel() == num_modes,
-                    "the index tables have to be contiguous int32 CUDA tensors of length num_modes");
-    }
-    TORCH_CHECK(mixed.is_cuda() && mixed.scalar_type() == at::kChar && mixed.is_contiguous()
-                && mixed.numel() == num_modes,
-                "mixed has to be a contiguous int8 CUDA tensor of length num_modes");
+// The registers of one patch: the geometry the kernel is written against, derived
+// once from the rotation and the pure/mixed classification of the modes.
+class PatchProjector {
+public:
+    PatchProjector(torch::Tensor rotation, torch::Tensor is_mixed) {
+        TORCH_CHECK(rotation.is_cuda(), "rotation has to be a CUDA tensor");
+        TORCH_CHECK(rotation.dim() == 2 && rotation.size(0) == rotation.size(1)
+                    && rotation.size(0) % 2 == 0,
+                    "rotation has to be a square (2 * num_modes) x (2 * num_modes) tensor");
+        const int64_t num_modes = rotation.size(0) / 2;
+        TORCH_CHECK(is_mixed.numel() == num_modes, "is_mixed has to have one entry per mode");
+        num_modes_ = num_modes;
+        device_ = rotation.device();
 
-    const int64_t pure_count = amps.size(0);
-    const int64_t size = amps.size(1);
-    TORCH_CHECK(size > 0 && (size & (size - 1)) == 0, "size has to be a power of two");
-    int64_t size_bits = 0;
-    while ((int64_t(1) << size_bits) < size) {
-        ++size_bits;
+        const auto flags = is_mixed.to(torch::kCPU).to(torch::kLong).contiguous();
+        const auto* flag_ptr = flags.data_ptr<int64_t>();
+        num_mixed_ = static_cast<int64_t>(std::count(flag_ptr, flag_ptr + num_modes, 1));
+        num_pure_ = num_modes_ - num_mixed_;
+        size_ = int64_t(1) << num_mixed_;
+        pure_count_ = int64_t(1) << num_pure_;
+        size_bits_ = num_mixed_;
+
+        // Per-mode tables.  Mode k of the mixed register occupies bit
+        // num_mixed - 1 - (its position among the mixed modes), big-endian, and
+        // the modes below it are the ones the Jordan-Wigner sign counts.
+        std::vector<int32_t> below(num_modes), flip_mask(num_modes), subset_flip(num_modes);
+        std::vector<int32_t> pure_lo(num_modes), pure_hi(num_modes);
+        std::vector<int8_t> mixed(num_modes, 0);
+        int64_t mixed_position = 0, pure_position = 0;
+        for (int64_t k = 0; k < num_modes; ++k) {
+            pure_lo[k] = static_cast<int32_t>((int64_t(1) << pure_position) - 1);
+            pure_hi[k] = pure_lo[k];
+            below[k] = static_cast<int32_t>(((int64_t(1) << mixed_position) - 1)
+                                            << (num_mixed_ - mixed_position));
+            if (flag_ptr[k] == 1) {
+                mixed[k] = 1;
+                flip_mask[k] = static_cast<int32_t>(int64_t(1) << (num_mixed_ - 1 - mixed_position));
+                ++mixed_position;
+            } else {
+                subset_flip[k] = static_cast<int32_t>(int64_t(1) << pure_position);
+                pure_hi[k] |= subset_flip[k];
+                ++pure_position;
+            }
+        }
+        // the derived tables are built on the host and copied to the device
+        const auto index_options = torch::TensorOptions().dtype(torch::kInt32);
+        const auto flag_options = torch::TensorOptions().dtype(torch::kInt8);
+        below_ = torch::from_blob(below.data(), {num_modes}, index_options).to(device_);
+        flip_mask_ = torch::from_blob(flip_mask.data(), {num_modes}, index_options).to(device_);
+        subset_flip_ = torch::from_blob(subset_flip.data(), {num_modes}, index_options).to(device_);
+        pure_lo_ = torch::from_blob(pure_lo.data(), {num_modes}, index_options).to(device_);
+        pure_hi_ = torch::from_blob(pure_hi.data(), {num_modes}, index_options).to(device_);
+        mixed_ = torch::from_blob(mixed.data(), {num_modes}, flag_options).to(device_);
+
+        // The even and the odd Majorana of every mode, as one column per patch
+        // Majorana: rotation rows 0, 2, ... and 1, 3, ... transposed.
+        const auto complex_rotation = rotation.to(torch::kComplexDouble);
+        const auto complex_options = torch::TensorOptions().dtype(torch::kComplexDouble)
+                                                         .device(device_);
+        elem_even_ = complex_rotation.slice(0, 0, complex_rotation.size(0), 2)
+                                    .transpose(0, 1).contiguous();
+        elem_odd_ = complex_rotation.slice(0, 1, complex_rotation.size(0), 2)
+                                   .transpose(0, 1).contiguous();
+
+        // The pure vacuum: the identity on the mixed register, pure register at 0.
+        vacuum_ = torch::zeros({pure_count_, size_, size_}, complex_options);
+        vacuum_.select(0, 0).copy_(torch::eye(size_, complex_options));
     }
-    auto out = torch::empty_like(amps);
-    if (num_modes == 0 || size == 0) {
-        return out.zero_();
+
+    // The amplitude state a string starts from, shape (pure_count, size, size).
+    // The same buffer is returned every time; ``apply`` never writes into it.
+    torch::Tensor vacuum() const {
+        return vacuum_;
     }
-    const int64_t total = pure_count * size * size;
-    const int64_t blocks = std::min<int64_t>((total + BLOCK - 1) / BLOCK, 65535);
-    apply_label_kernel<<<blocks, BLOCK, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const cuDoubleComplex*>(amps.data_ptr<c10::complex<double>>()),
-        reinterpret_cast<cuDoubleComplex*>(out.data_ptr<c10::complex<double>>()),
-        reinterpret_cast<const cuDoubleComplex*>(elem_even.data_ptr<c10::complex<double>>()),
-        reinterpret_cast<const cuDoubleComplex*>(elem_odd.data_ptr<c10::complex<double>>()),
-        below.data_ptr<int32_t>(),
-        flip_mask.data_ptr<int32_t>(),
-        subset_flip.data_ptr<int32_t>(),
-        pure_lo.data_ptr<int32_t>(),
-        pure_hi.data_ptr<int32_t>(),
-        mixed.data_ptr<int8_t>(),
-        num_modes, pure_count, size, size_bits);
-    return out;
-}
+
+    // Apply the normal-mode expansion of patch Majorana `patch_index` to the
+    // batched amplitude state `amps`, shape (pure_count, size, size).
+    torch::Tensor apply(torch::Tensor amps, int64_t patch_index) const {
+        TORCH_CHECK(amps.is_cuda() && amps.scalar_type() == at::kComplexDouble
+                    && amps.is_contiguous() && amps.dim() == 3,
+                    "amps has to be a contiguous complex128 (pure_count, size, size) CUDA tensor");
+        TORCH_CHECK(amps.size(0) == pure_count_ && amps.size(1) == size_ && amps.size(2) == size_,
+                    "amps has the wrong shape for this patch");
+        TORCH_CHECK(patch_index >= 0 && patch_index < 2 * num_modes_,
+                    "patch_index is outside the Majoranas of the patch");
+        auto out = torch::empty_like(amps);
+        if (num_modes_ == 0 || size_ == 0) {
+            return out.zero_();
+        }
+        const int64_t total = pure_count_ * size_ * size_;
+        const int64_t blocks = std::min<int64_t>((total + BLOCK - 1) / BLOCK, 65535);
+        apply_label_kernel<<<blocks, BLOCK, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const cuDoubleComplex*>(amps.data_ptr<c10::complex<double>>()),
+            reinterpret_cast<cuDoubleComplex*>(out.data_ptr<c10::complex<double>>()),
+            reinterpret_cast<const cuDoubleComplex*>(elem_even_.data_ptr<c10::complex<double>>()),
+            reinterpret_cast<const cuDoubleComplex*>(elem_odd_.data_ptr<c10::complex<double>>()),
+            patch_index * num_modes_,
+            below_.data_ptr<int32_t>(),
+            flip_mask_.data_ptr<int32_t>(),
+            subset_flip_.data_ptr<int32_t>(),
+            pure_lo_.data_ptr<int32_t>(),
+            pure_hi_.data_ptr<int32_t>(),
+            mixed_.data_ptr<int8_t>(),
+            num_modes_, pure_count_, size_, size_bits_);
+        return out;
+    }
+
+private:
+    int64_t num_modes_ = 0, num_mixed_ = 0, num_pure_ = 0;
+    int64_t size_ = 1, pure_count_ = 1, size_bits_ = 0;
+    torch::Device device_ = torch::kCUDA;
+    torch::Tensor elem_even_, elem_odd_;
+    torch::Tensor below_, flip_mask_, subset_flip_, pure_lo_, pure_hi_, mixed_;
+    torch::Tensor vacuum_;
+};
 
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("apply_label", &apply_label,
-          "Apply one normal-mode expansion of a Majorana label to the batched patch state");
+    pybind11::class_<PatchProjector>(m, "PatchProjector",
+                                     "The registers of one Gaussian patch: the kernel geometry\n"
+                                     "derived from the rotation and the pure/mixed modes.")
+        .def(pybind11::init<torch::Tensor, torch::Tensor>(),
+             pybind11::arg("rotation"), pybind11::arg("is_mixed"))
+        .def("vacuum", &PatchProjector::vacuum,
+             "The amplitude state a Majorana string starts from, (pure_count, size, size)")
+        .def("apply", &PatchProjector::apply,
+             pybind11::arg("amps"), pybind11::arg("patch_index"),
+             "Apply one patch Majorana to the batched amplitude state");
 }
