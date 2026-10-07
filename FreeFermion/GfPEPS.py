@@ -9,13 +9,10 @@ from FreeFermion.linalg import RandPureCov, symplectic_form
 from typing import Optional
 
 '''
-Based on arxiv:2012.04666: C.-M. Jian, B. Bauer, A. Keselman and A. W. W. Ludwig,
-"Criticality and entanglement in non-unitary quantum circuits and tensor networks
-of non-interacting fermions", Phys. Rev. B 106, 054309 (2022), Sec. III:
-fermionic Gaussian tensor networks.
+Based on arxiv:2012.04666: C.-M. Jian, B. Bauer, A. Keselman and A. W. W. Ludwig,"Criticality and entanglement in non-unitary quantum circuits and tensor networks
+of non-interacting fermions", Phys. Rev. B 106, 054309 (2022), Sec. III:fermionic Gaussian tensor networks.
 
-A node carries ``dim_of_node(node)`` Majorana modes and is described by its
-covariance matrix ``Gamma_ij = < i/2 [gamma_i, gamma_j] >`` that are grouped into blocks by the legs of the graph. 
+A node carries ``dim_of_node(node)`` Majorana modes and is described by its covariance matrix ``Gamma_ij = < i/2 [gamma_i, gamma_j] >`` that are grouped into blocks by the legs of the graph. 
 '''
 
 @dataclass(frozen=True, order=True)
@@ -115,9 +112,7 @@ class Node:
     @classmethod
     def from_dense(cls, covariance: Tensor, sizes: dict[Leg, int]) -> 'Node':
         '''
-        build a node from a dense covariance whose blocks follow the legs of sizes,
-        in the order in which sizes lists them; the only place where the layout of a
-        dense matrix is read.
+        build a node from a dense covariance whose blocks follow the legs of sizes, in the order in which sizes lists them; the only place where the layout of a dense matrix is read.
         Args:
             covariance: the real antisymmetric covariance, of size sum(sizes.values()).
             sizes: the number of modes of every leg, in the order of the matrix.
@@ -140,8 +135,7 @@ class Node:
 
     def assemble(self, order: list[Leg] | None = None) -> Tensor:
         '''
-        the dense covariance of this node with its blocks placed in the given leg
-        order, which is what the local linear algebra of a contraction needs.
+        the dense covariance of this node with its blocks placed in the given leg order, which is what the local linear algebra of a contraction needs.
         Args:
             order: the legs in the order of the matrix, legs() by default.
         Returns:
@@ -188,9 +182,7 @@ class Node:
 
     def renamed(self, mapping: dict[Bond, Bond]) -> 'Node':
         '''
-        the same blocks under the new names of their legs, which is how a node
-        follows a relabelling of the graph.  Every leg keeps its position and its
-        blocks, only the keys change.
+        the same blocks under the new names of their legs, which is how a node follows a relabelling of the graph.  Every leg keeps its position and its blocks, only the keys change.
         Args:
             mapping: old bond -> new bond.
         Returns:
@@ -205,29 +197,17 @@ class Node:
 
     def glue(self, other: 'Node', bonds: list[Bond], flip: list[Bond]) -> 'Node':
         '''
-        glue this node to another along the bonds between them, Eq. (9) of
-        Jian-Bauer-Keselman-Ludwig (arXiv:2012.04666):
+        glue this node to another along the bonds between them, Eq. (9) of Jian-Bauer-Keselman-Ludwig (arXiv:2012.04666):
 
             psi = blockdiag(G_oo, U_oo) + C K^-1 C^T,   K = [[G_bb, I], [-I, U_bb]],
 
-        with C the coupling of the open legs to the contracted modes and K the kernel
-        of the projector prod_k (1 + i gamma_k upsilon_k)/2; the equation holds for
-        any set of modes, so all the bonds between the two nodes are contracted at
-        once, cross blocks between two of them included, which is what makes a second
-        bond between the same two nodes unnecessary to glue on its own.  The projector
-        pairs the first end of a bond as gamma with its second end as upsilon, so this
-        node, which takes the gamma slot, has its bond basis flipped for the bonds of
-        which it is the second end.  A singular K, which two uncorrelated nodes have,
-        is handled with the pseudo-inverse: the covariance is well defined there, only
-        the solve is not.
+        with C the coupling of the open legs to the contracted modes and K the kernel of the projector prod_k (1 + i gamma_k upsilon_k)/2; the equation holds for any set of modes, so all the bonds between the two nodes are contracted at once, cross blocks between two of them included, which is what makes a second bond between the same two nodes unnecessary to glue on its own.  The projector pairs the first end of a bond as gamma with its second end as upsilon, so this node, which takes the gamma slot, has its bond basis flipped for the bonds of which it is the second end.  A singular K, which two uncorrelated nodes have, is handled with the pseudo-inverse: the covariance is well defined there, only the solve is not.
         Args:
             other: the node at the other end of the bonds.
             bonds: the bonds to contract, all of them between the two nodes.
-            flip: the bonds of which this node is the second end, and which therefore
-                have to be flipped to take the gamma slot.
+            flip: the bonds of which this node is the second end, and which therefore have to be flipped to take the gamma slot.
         Returns:
-            The glued node, keyed by the external leg (the modes of both nodes) and
-            by the surviving bonds of both.
+            The glued node, keyed by the external leg (the modes of both nodes) and by the surviving bonds of both.
         '''
         self = self.flipped(flip) if flip else self
         contracted = set(bonds)
@@ -276,10 +256,11 @@ class GfPEPS:
                  dtype: torch.dtype = REAL,
                  device: torch.device = CUDA):
         '''
-        graph: An instance of the Graph class representing the structure of the system.
-        ext_dim: A list of integers representing the external dimensions for each node.
-        dtype: Data type of the covariance matrices.
-        device: Device the covariance matrices live on (``cuda`` by default).
+        Args:
+            graph: An instance of the Graph class representing the structure of the system.
+            ext_dim: A list of integers representing the external dimensions for each node.
+            dtype: Data type of the covariance matrices.
+            device: Device the covariance matrices live on (``cuda`` by default).
         '''
         self.graph = graph
         self.ext_dim = list(ext_dim)
@@ -335,8 +316,7 @@ class GfPEPS:
     @property
     def tensors(self) -> list[Tensor]:
         '''
-        the dense covariance of every node, assembled from the blocks of the nodes on
-        first use.
+        the dense covariance of every node, assembled from the blocks of the nodes on first use.
         Returns:
             The list of node covariances, in node order.
         '''
@@ -371,8 +351,7 @@ class GfPEPS:
                          ext_dim: list[int],
                          tensors: list[Tensor]) -> 'GfPEPS':
         '''
-        Build a network from known node covariances, checking that every one
-        is a real antisymmetric matrix of the size the graph and ext_dim ask for.
+        Build a network from known node covariances, checking that every one is a real antisymmetric matrix of the size the graph and ext_dim ask for.
         Args:
             graph: the structure of the system.
             ext_dim: external Majorana modes of every node.
@@ -400,8 +379,7 @@ class GfPEPS:
     @classmethod
     def from_global_covariance(cls, covariance: Tensor) -> 'GfPEPS':
         '''
-        Wrap the covariance of a whole system as a single node without bonds,
-        so that a state built elsewhere can be used with the methods of this class.
+        Wrap the covariance of a whole system as a single node without bonds, so that a state built elsewhere can be used with the methods of this class.
         Args:
             covariance: real antisymmetric covariance of 2n Majorana modes.
         Returns:
@@ -412,8 +390,7 @@ class GfPEPS:
     @classmethod
     def from_hamiltonian(cls, matrix: Tensor) -> 'GfPEPS':
         '''
-        Ground state of the quadratic Hamiltonian H = (i/4) gamma^T M gamma
-        as a single node: Gamma = i sign(iM).
+        Ground state of the quadratic Hamiltonian H = (i/4) gamma^T M gamma as a single node: Gamma = i sign(iM).
         Args:
             matrix: the real antisymmetric Majorana matrix M, shape (2n, 2n).
         Returns:
@@ -441,10 +418,7 @@ class GfPEPS:
                       dtype: torch.dtype = REAL,
                       device: torch.device = CUDA) -> 'GfPEPS':
         '''
-        Network of uncorrelated nodes: every node covariance is block
-        diagonal, with the given site state on its external modes (the vacuum by
-        default) and the vacuum covariance on every bond block, so the whole
-        network is pure and no site is correlated with another.
+        Network of uncorrelated nodes: every node covariance is block diagonal, with the given site state on its external modes (the vacuum by default) and the vacuum covariance on every bond block, so the whole network is pure and no site is correlated with another.
         Args:
             graph: the structure of the system.
             ext_dim: external Majorana modes of every node.
@@ -554,11 +528,12 @@ class GfPEPO:
                  dtype: torch.dtype = REAL,
                  device: torch.device = CUDA):
         '''
-        graph: An instance of the Graph class representing the structure of the system.
-        ext_dim_in: A list of integers representing the external dimensions for each node.
-        ext_dim_out: A list of integers representing the external dimensions for each node.
-        dtype: Data type of the covariance matrices.
-        device: Device the covariance matrices live on (``cuda`` by default).
+        Args:
+            graph: An instance of the Graph class representing the structure of the system.
+            ext_dim_in: A list of integers representing the external dimensions for each node.
+            ext_dim_out: A list of integers representing the external dimensions for each node.
+            dtype: Data type of the covariance matrices.
+            device: Device the covariance matrices live on (``cuda`` by default).
         '''
         self.graph = graph
         self.ext_dim_in = ext_dim_in

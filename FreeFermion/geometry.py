@@ -1,18 +1,3 @@
-r'''
-Finite two-dimensional lattices for the free-fermion states of this repository: a
-``Lattice`` holds the primitive cell, the sites of a unit cell and the bonds as cell
-offsets, a ``Geometry`` is one finite instance of it with a boundary condition per
-direction, and ``Bound`` attaches a ``GfPEPS`` to the sites of a geometry so that
-patches are addressed by site.
-
-    SQUARE.torus(24, 36)           # periodic in both directions
-    HONEYCOMB.cylinder(24, 36)     # periodic along a1, open along a2
-    TRIANGULAR.rectangle(24, 36)   # open in both directions
-
-The site labels are ``site = per_cell * (i + n1 * j) + basis``, so site ``r`` owns the
-Majoranas ``2r`` and ``2r+1`` exactly as everywhere else in the repository, and a
-``Geometry`` is the only place where the lattice geometry is written down.
-'''
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Iterable, Sequence
